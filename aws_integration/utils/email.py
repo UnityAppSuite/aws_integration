@@ -48,7 +48,7 @@ def chunk(iterable, size):
         yield [first, *islice(iterator, size - 1)]
 
 
-def sendmail(subject, message, recepient, cc_recepient, bcc_recepient, reply_tos=None):
+def sendmail(subject, message, recepient, cc_recepient=[], bcc_recepient=[], reply_tos=None):
     email_sender = frappe.get_single("AWS Settings")
     destinations = SESDestination(tos=recepient, ccs=cc_recepient, bccs=bcc_recepient)
 
@@ -98,6 +98,14 @@ def send_email_in_batches(data):
 
 
 def flush_email_queue():
+    aws_settings = frappe.get_single("AWS Settings")
+    if aws_settings.enable_aws and aws_settings.flush_email_queue_in_batches:
+        flush_email_queue_in_batches()
+    else:
+        flush_default_email_queue()
+
+
+def flush_default_email_queue():
     """flush email queue, every time: called from scheduler.
 
     This should not be called outside of background jobs.
@@ -125,6 +133,59 @@ def flush_email_queue():
             try:
                 email_queue: EmailQueue = frappe.get_doc("Email Queue", row.name)
                 email_queue.send()
+            except Exception:
+                frappe.get_doc("Email Queue", row.name).log_error()
+                failed_email_queues.append(row.name)
+
+                if (
+                    len(failed_email_queues) / len(email_queue_batch)
+                    > EMAIL_QUEUE_BATCH_FAILURE_THRESHOLD_PERCENT
+                    and len(failed_email_queues) > EMAIL_QUEUE_BATCH_FAILURE_THRESHOLD_COUNT
+                ):
+                    frappe.throw(
+                        _("Email Queue flushing aborted due to too many failures.")
+                    )
+        time.sleep(1)
+
+
+
+def flush_email_queue_in_batches():
+    """flush email queue, every time: called from scheduler.
+
+    This should not be called outside of background jobs.
+    """
+    from frappe.email.doctype.email_queue.email_queue import EmailQueue
+
+    # To avoid running jobs inside unit tests
+    if frappe.are_emails_muted():
+        msgprint(_("Emails are muted"))
+
+    if cint(frappe.db.get_default("suspend_email_queue")) == 1:
+        return
+    
+    email_batch_size = frappe.get_value(
+        "AWS Settings", "AWS Settings", "email_batch_size"
+    )
+
+    email_queue_batch = get_queue(email_batch_size)
+    if not email_queue_batch:
+        return
+
+    failed_email_queues = []
+    for data in chunk(email_queue_batch, cint(email_batch_size)):
+        for row in data:
+            try:
+                email_queue: EmailQueue = frappe.get_doc("Email Queue", row.name)
+                recipient = frappe.get_all("Email Queue Recipient", {"parent": email_queue.name}, pluck="recipient")
+                res = sendmail(
+                    email_queue.subject,
+                    email_queue.message,
+                    recipient,
+                )
+                if res:
+                    frappe.db.set_value("Email Queue", email_queue.name, "status", "Sent")
+                else:
+                    frappe.throw(_(f"Failed to send email. Please try again. Email Queue: {email_queue.name}"))
             except Exception:
                 frappe.get_doc("Email Queue", row.name).log_error()
                 failed_email_queues.append(row.name)

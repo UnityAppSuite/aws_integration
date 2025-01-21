@@ -13,6 +13,7 @@
   "region",
   "ses_settings_section",
   "source_email",
+  "flush_email_queue_in_batches",
   "column_break_kjvj",
   "sender_name",
   "email_batch_size"
@@ -78,12 +79,19 @@
    "fieldname": "enable_aws",
    "fieldtype": "Check",
    "label": "Enable AWS"
+  },
+  {
+   "default": "0",
+   "description": "Send emails using batching else it'll use default email queue flushing with SES Rate limiting",
+   "fieldname": "flush_email_queue_in_batches",
+   "fieldtype": "Check",
+   "label": "Flush Email Queue In Batches"
   }
  ],
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2025-01-07 10:10:24.775538",
+ "modified": "2025-01-09 18:17:16.402187",
  "modified_by": "Administrator",
  "module": "Aws Integration",
  "name": "AWS Settings",
