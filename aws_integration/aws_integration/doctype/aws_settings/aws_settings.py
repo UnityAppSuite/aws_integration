@@ -4,7 +4,7 @@ import boto3
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from aws_integration.utils import validate_email
+from frappe.utils import validate_email_address
 
 
 class AWSSettings(Document):
@@ -31,13 +31,14 @@ class AWSSettings(Document):
                 )
 
     def get_ses_client(self):
-        aws_secret_access_key = self.get_password("aws_secret_access_key")
-        return boto3.client(
-            "sesv2",
-            region_name=self.region,
-            aws_access_key_id=self.aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-        )
+        if not hasattr(self, "_ses_client"):
+            self._ses_client = boto3.client(
+                "sesv2",
+                region_name=self.region,
+                aws_access_key_id=self.aws_access_key_id,
+                aws_secret_access_key=self.get_password("aws_secret_access_key"),
+            )
+        return self._ses_client
 
     def validate(self):
         if self.enable_aws:
@@ -65,15 +66,23 @@ class AWSSettings(Document):
         if self.enable_s3_backups:
             if not self.enable_s3 or not self.enable_aws:
                 frappe.throw(_("AWS and S3 must be enabled to use S3 Backups"))
-            if self.s3_backup_notify_email and not validate_email(self.s3_backup_notify_email):
+            if self.s3_backup_notify_email and not validate_email_address(self.s3_backup_notify_email):
                 frappe.throw(_("Please enter a valid backup notification email address"))
             if self.s3_backup_retention_count and self.s3_backup_retention_count < 0:
                 frappe.throw(_("Keep Last N Backups must be 0 or greater"))
             if self.s3_backup_retention_days and self.s3_backup_retention_days < 0:
                 frappe.throw(_("Delete Backups Older Than (days) must be 0 or greater"))
 
-        if self.source_email and not validate_email(self.source_email):
-            frappe.throw("Please enter valid email address")
+        if self.source_email and not validate_email_address(self.source_email):
+            frappe.throw(_("Please enter a valid source email address"))
+
+    def _format_sender(self):
+        name = (self.sender_name or "").replace("<", "").replace(">", "")
+        name = name.replace("\n", "").replace("\r", "").replace("\x00", "")
+        name = name.strip()
+        if name:
+            return f"{name} <{self.source_email}>"
+        return self.source_email
 
     def send_email(
         self,
@@ -83,21 +92,11 @@ class AWSSettings(Document):
         html=None,
         reply_tos=None,
     ):
-        """
-        Sends emails in batches with a rate limit of 25 per second.
+        ses_client = self.get_ses_client()
+        source = self._format_sender()
 
-        :param destinations: List of destinations (objects with `to_service_format` method).
-        :param subject: Email subject.
-        :param text: Plain text body (optional).
-        :param html: HTML body (optional).
-        :param reply_tos: List of reply-to addresses (optional).
-        :param batch_size: Number of recipients per batch (default: 25).
-        :return: List of message IDs or None for failed attempts.
-        """
-        self.source = f"{self.sender_name} <{self.source_email}>"
-        self.ses_client = self.get_ses_client()
         send_args = {
-            "FromEmailAddress": self.source,
+            "FromEmailAddress": source,
             "Destination": destinations.to_service_format(),
             "Content": {
                 "Simple": {
@@ -122,18 +121,18 @@ class AWSSettings(Document):
         if reply_tos:
             send_args["ReplyToAddresses"] = reply_tos
 
+        # Let SES API errors propagate to caller
+        response = ses_client.send_email(**send_args)
+
+        # Log in separate try/except — logging failure must not mask successful send
         try:
-            response = self.ses_client.send_email(**send_args)
             message_id = response.get("MessageId")
-            if not message_id:
-                frappe.throw(_("Failed to send email. Please try again."))
-            self.add_ses_logs(subject, content or html, message_id, destinations)
-            return response
-        except Exception as e:
-            frappe.log_error(
-                _("Failed to send email: {error}").format(error=str(e)),
-                frappe.get_traceback(),
-            )
+            if message_id:
+                self.add_ses_logs(subject, content or html, message_id, destinations)
+        except Exception:
+            frappe.log_error(title="SES Log Error", message=frappe.get_traceback())
+
+        return response
 
     def add_ses_logs(self, subject, message, message_id, destinations):
         """Add SES logs after sending email."""

@@ -1,15 +1,13 @@
-import re
 import time
 import frappe
-from frappe import _, cint, msgprint
+from frappe import _, cint
 from itertools import islice
 
 from frappe.email.queue import (
     EMAIL_QUEUE_BATCH_FAILURE_THRESHOLD_COUNT,
     EMAIL_QUEUE_BATCH_FAILURE_THRESHOLD_PERCENT,
-    get_queue,
 )
-from frappe.utils import now_datetime
+from frappe.utils import now_datetime, validate_email_address
 
 
 class SESDestination:
@@ -30,13 +28,12 @@ class SESDestination:
 
 
 def validate_email(email):
-    """Regular expression to validate email addresses."""
-    email_pattern = re.compile(r"[^@]+@[^@]+\.[^@]+")
-    return bool(email_pattern.match(email))
+    return bool(validate_email_address(email))
 
 
 def is_html(text):
     """Regular expression to check for HTML tags"""
+    import re
     html_pattern = re.compile(r"<([a-zA-Z]+)[^>]*>(.*?)</\1>|<([a-zA-Z]+)[^>]*>")
     return bool(html_pattern.search(text))
 
@@ -76,25 +73,70 @@ def send_email_in_batches(data):
             "recepients": [],
             "cc_recepients": [],
             "bcc_recepients": [],
-            reply_tos: []
+            "reply_tos": []
         }
     }
     """
     email_batch_size = frappe.get_value(
         "AWS Settings", "AWS Settings", "email_batch_size"
     )
+    rate_limiter = SESRateLimiter(rate_per_second=cint(email_batch_size) or 1)
 
-    for student_data in chunk(data.keys(), cint(email_batch_size)):
-        for key in student_data:
-            student = data[key]
-            sendmail(
-                student.get("subject"),
-                student.get("content"),
-                student.get("recepients"),
-                student.get("cc_recepients"),
-                student.get("bcc_recepients"),
-            )
-        time.sleep(1)
+    for key in data:
+        if not rate_limiter.acquire(timeout=30):
+            frappe.log_error(title="SES Rate Limit", message="Timed out waiting for rate limit slot")
+            return
+        entry = data[key]
+        sendmail(
+            entry.get("subject"),
+            entry.get("content"),
+            entry.get("recepients"),
+            entry.get("cc_recepients"),
+            entry.get("bcc_recepients"),
+            entry.get("reply_tos"),
+        )
+
+
+class SESRateLimiter:
+    """Fixed-window rate limiter using Redis for SES email sending.
+
+    Uses per-second Redis keys with atomic INCR to track sends.
+    When at the limit, waits until the next 1-second window opens.
+    Safe across multiple RQ workers via Redis atomicity.
+    """
+
+    REDIS_KEY_PREFIX = "aws_ses_rate"
+
+    def __init__(self, rate_per_second=None):
+        self.rate = rate_per_second or cint(
+            frappe.get_value("AWS Settings", "AWS Settings", "email_batch_size")
+        ) or 14
+
+    def acquire(self, timeout=30):
+        """Block until a send slot is available.
+
+        Returns True when acquired, False on timeout.
+        """
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            window = int(time.time())
+            key = f"{self.REDIS_KEY_PREFIX}:{window}"
+
+            # Atomic increment — safe across workers
+            count = frappe.cache.incrby(key, 1)
+            if count == 1:
+                frappe.cache.expire(key, 3)
+
+            if count <= self.rate:
+                return True
+
+            # Over limit — undo our increment, wait for next window
+            frappe.cache.decrby(key, 1)
+            sleep_time = 1.0 - (time.time() % 1)
+            time.sleep(max(0.01, sleep_time))
+
+        return False
 
 
 def flush_email_queue():
@@ -104,13 +146,12 @@ def flush_email_queue():
     """
     from frappe.email.doctype.email_queue.email_queue import EmailQueue
 
-    # To avoid running jobs inside unit tests
     if frappe.are_emails_muted():
-        msgprint(_("Emails are muted"))
+        return
 
     if cint(frappe.db.get_default("suspend_email_queue")) == 1:
         return
-    
+
     email_batch_size = frappe.get_value(
         "AWS Settings", "AWS Settings", "email_batch_size"
     )
@@ -119,26 +160,34 @@ def flush_email_queue():
     if not email_queue_batch:
         return
 
+    rate_limiter = SESRateLimiter(rate_per_second=cint(email_batch_size) or 1)
     failed_email_queues = []
-    for data in chunk(email_queue_batch, cint(email_batch_size)):
-        for row in data:
-            try:
-                email_queue: EmailQueue = frappe.get_doc("Email Queue", row.name)
-                email_queue.send()
-            except Exception:
-                frappe.get_doc("Email Queue", row.name).log_error()
-                failed_email_queues.append(row.name)
 
-                if (
-                    len(failed_email_queues) / len(email_queue_batch)
-                    > EMAIL_QUEUE_BATCH_FAILURE_THRESHOLD_PERCENT
-                    and len(failed_email_queues) > EMAIL_QUEUE_BATCH_FAILURE_THRESHOLD_COUNT
-                ):
-                    frappe.throw(
-                        _("Email Queue flushing aborted due to too many failures.")
-                    )
-        time.sleep(1)
+    for row in email_queue_batch:
+        if not rate_limiter.acquire(timeout=30):
+            frappe.log_error(
+                title="SES Rate Limit Timeout",
+                message="Timed out waiting for SES rate limit slot. Stopping flush.",
+            )
+            break
 
+        try:
+            email_queue: EmailQueue = frappe.get_doc("Email Queue", row.name, for_update=True)
+            email_queue.send()
+        except Exception:
+            frappe.get_doc("Email Queue", row.name).log_error()
+            failed_email_queues.append(row.name)
+
+            if (
+                len(failed_email_queues) / len(email_queue_batch)
+                > EMAIL_QUEUE_BATCH_FAILURE_THRESHOLD_PERCENT
+                and len(failed_email_queues) > EMAIL_QUEUE_BATCH_FAILURE_THRESHOLD_COUNT
+            ):
+                frappe.log_error(
+                    title="Email Queue Flush Aborted",
+                    message="Too many failures in email queue batch",
+                )
+                break
 
 
 def get_queue(email_batch_size=None):
@@ -153,16 +202,12 @@ def get_queue(email_batch_size=None):
     batch_size = batch_per_minute or cint(frappe.conf.email_queue_batch_size) or 500
 
     return frappe.db.sql(
-		f"""select
-			name, sender
-		from
-			`tabEmail Queue`
-		where
-			(status='Not Sent' or status='Partially Sent') and
-			(send_after is null or send_after < %(now)s)
-		order
-			by priority desc, retry asc, creation asc
-		limit {batch_size}""",
-		{"now": now_datetime()},
-		as_dict=True,
-	)
+        """SELECT name, sender
+        FROM `tabEmail Queue`
+        WHERE (status='Not Sent' OR status='Partially Sent')
+            AND (send_after IS NULL OR send_after < %(now)s)
+        ORDER BY priority DESC, retry ASC, creation ASC
+        LIMIT %(batch_size)s""",
+        {"now": now_datetime(), "batch_size": batch_size},
+        as_dict=True,
+    )
