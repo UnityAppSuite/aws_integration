@@ -50,6 +50,8 @@ def chunk(iterable, size):
 
 def sendmail(subject, message, recepient, cc_recepient, bcc_recepient, reply_tos=None):
     email_sender = frappe.get_single("AWS Settings")
+    if not email_sender.enable_bulk_ses_email:
+        frappe.throw(_("Bulk SES Email is not enabled in AWS Settings"))
     destinations = SESDestination(tos=recepient, ccs=cc_recepient, bccs=bcc_recepient)
 
     email_params = {
@@ -102,6 +104,10 @@ def flush_email_queue():
 
     This should not be called outside of background jobs.
     """
+    settings = frappe.get_cached_doc("AWS Settings")
+    if not settings.enable_aws:
+        return
+
     from frappe.email.doctype.email_queue.email_queue import EmailQueue
 
     # To avoid running jobs inside unit tests

@@ -85,6 +85,13 @@ def generate_file(key=None, file_name=None):
 
 
 @frappe.whitelist()
+def get_s3_provider_regions(provider):
+    """Return available regions for a given S3 provider."""
+    from aws_integration.s3.providers import get_provider_regions
+    return get_provider_regions(provider)
+
+
+@frappe.whitelist()
 def test_s3_connection():
     """Test S3 bucket connectivity.
 

@@ -9,6 +9,7 @@
   "column_break_zdyv",
   "enable_s3",
   "enable_s3_backups",
+  "enable_bulk_ses_email",
   "tab_break_general",
   "general_settings_section",
   "aws_access_key_id",
@@ -23,6 +24,12 @@
   "email_batch_size",
   "tab_break_s3",
   "s3_settings_section",
+  "s3_provider",
+  "s3_access_key_id",
+  "column_break_s3_creds",
+  "s3_secret_access_key",
+  "s3_region",
+  "s3_config_section",
   "s3_endpoint_url",
   "s3_bucket_name",
   "column_break_s3_1",
@@ -130,7 +137,7 @@
    "label": "Email Batch Size"
   },
   {
-   "depends_on": "enable_s3",
+   "depends_on": "enable_aws",
    "fieldname": "tab_break_s3",
    "fieldtype": "Tab Break",
    "label": "S3 Storage"
@@ -138,7 +145,7 @@
   {
    "fieldname": "s3_settings_section",
    "fieldtype": "Section Break",
-   "label": "S3 Configuration"
+   "label": "S3 Credentials"
   },
   {
    "default": "0",
@@ -148,26 +155,68 @@
    "label": "Enable S3 File Storage"
   },
   {
+   "default": "AWS S3",
+   "fieldname": "s3_provider",
+   "fieldtype": "Select",
+   "label": "S3 Provider",
+   "options": "AWS S3\nWasabi\nBackblaze B2\nDigitalOcean Spaces\nCloudflare R2\nVultr Object Storage\nLinode Object Storage\nScaleway\nIDrive e2\nOther"
+  },
+  {
+   "fieldname": "s3_access_key_id",
+   "fieldtype": "Data",
+   "label": "S3 Access Key ID",
+   "mandatory_depends_on": "eval:doc.enable_aws && doc.enable_s3"
+  },
+  {
+   "fieldname": "column_break_s3_creds",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "s3_secret_access_key",
+   "fieldtype": "Password",
+   "label": "S3 Secret Access Key",
+   "mandatory_depends_on": "eval:doc.enable_aws && doc.enable_s3"
+  },
+  {
+   "description": "e.g. us-east-1, eu-west-1. Leave blank to use General Settings region.",
+   "fieldname": "s3_region",
+   "fieldtype": "Data",
+   "label": "S3 Region"
+  },
+  {
+   "fieldname": "s3_config_section",
+   "fieldtype": "Section Break",
+   "label": "S3 Configuration"
+  },
+  {
    "default": "0",
-   "depends_on": "enable_s3",
+   "depends_on": "enable_aws",
    "fieldname": "enable_s3_backups",
    "fieldtype": "Check",
    "label": "Enable S3 Backups"
   },
   {
+   "default": "0",
+   "depends_on": "enable_aws",
+   "fieldname": "enable_bulk_ses_email",
+   "fieldtype": "Check",
+   "label": "Enable Bulk SES Email"
+  },
+  {
    "fieldname": "s3_bucket_name",
    "fieldtype": "Data",
    "label": "S3 Bucket Name",
-   "mandatory_depends_on": "enable_s3"
+   "mandatory_depends_on": "eval:doc.enable_aws && doc.enable_s3"
   },
   {
    "fieldname": "column_break_s3_1",
    "fieldtype": "Column Break"
   },
   {
-   "description": "Leave blank to use the same region as General Settings",
+   "description": "Deprecated — use S3 Region instead",
    "fieldname": "s3_bucket_region",
    "fieldtype": "Data",
+   "hidden": 1,
    "label": "S3 Bucket Region"
   },
   {
@@ -183,7 +232,7 @@
    "label": "S3 Folder Prefix"
   },
   {
-   "depends_on": "enable_s3",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3",
    "fieldname": "s3_upload_settings_section",
    "fieldtype": "Section Break",
    "label": "Upload Settings"
@@ -228,7 +277,7 @@
    "label": "Presigned URL Expiry (seconds)"
   },
   {
-   "depends_on": "enable_s3",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3",
    "description": "Files attached to these DocTypes will NOT be uploaded to S3",
    "fieldname": "exempt_doctypes_section",
    "fieldtype": "Section Break",
@@ -241,30 +290,30 @@
    "options": "S3 Exempt DocType"
   },
   {
-   "depends_on": "enable_s3",
+   "depends_on": "enable_aws",
    "fieldname": "tab_break_s3_backups",
    "fieldtype": "Tab Break",
    "label": "S3 Backups"
   },
   {
-   "depends_on": "enable_s3_backups",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "fieldname": "s3_backup_status_html",
    "fieldtype": "HTML",
    "label": "Backup Status"
   },
   {
-   "depends_on": "enable_s3_backups",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "fieldname": "s3_backup_config_section",
    "fieldtype": "Section Break",
    "label": "Backup Configuration"
   },
   {
    "default": "Daily",
-   "depends_on": "enable_s3_backups",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "fieldname": "s3_backup_frequency",
    "fieldtype": "Select",
    "label": "Backup Frequency",
-   "mandatory_depends_on": "enable_s3_backups",
+   "mandatory_depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "options": "Daily\nWeekly\nMonthly\nNone"
   },
   {
@@ -273,7 +322,7 @@
   },
   {
    "default": "1",
-   "depends_on": "enable_s3_backups",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "description": "Include public and private file tarballs in backup",
    "fieldname": "s3_backup_files",
    "fieldtype": "Check",
@@ -281,20 +330,20 @@
   },
   {
    "default": "6000",
-   "depends_on": "enable_s3_backups",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "description": "Max time (in seconds) for the backup background job. Increase for large sites. Default: 6000 (100 min)",
    "fieldname": "s3_backup_timeout",
    "fieldtype": "Int",
    "label": "Backup Job Timeout (seconds)"
   },
   {
-   "depends_on": "enable_s3_backups",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "fieldname": "s3_backup_storage_section",
    "fieldtype": "Section Break",
    "label": "Backup Storage"
   },
   {
-   "depends_on": "enable_s3_backups",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "description": "Leave blank to use the main S3 bucket",
    "fieldname": "s3_backup_bucket_name",
    "fieldtype": "Data",
@@ -305,21 +354,21 @@
    "fieldtype": "Column Break"
   },
   {
-   "depends_on": "enable_s3_backups",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "description": "S3 key prefix for backups",
    "fieldname": "s3_backup_folder_prefix",
    "fieldtype": "Data",
    "label": "Backup Folder Path"
   },
   {
-   "depends_on": "enable_s3_backups",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "fieldname": "s3_backup_retention_section",
    "fieldtype": "Section Break",
    "label": "Retention"
   },
   {
    "default": "0",
-   "depends_on": "enable_s3_backups",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "description": "Keep only the last N backups on S3. Set 0 to disable.",
    "fieldname": "s3_backup_retention_count",
    "fieldtype": "Int",
@@ -331,25 +380,25 @@
   },
   {
    "default": "0",
-   "depends_on": "enable_s3_backups",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "description": "Delete backups older than N days from S3. Set 0 to disable.",
    "fieldname": "s3_backup_retention_days",
    "fieldtype": "Int",
    "label": "Delete Backups Older Than (days)"
   },
   {
-   "depends_on": "enable_s3_backups",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "fieldname": "s3_backup_notify_section",
    "fieldtype": "Section Break",
    "label": "Notifications"
   },
   {
-   "depends_on": "enable_s3_backups",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "description": "Email address to receive backup notifications",
    "fieldname": "s3_backup_notify_email",
    "fieldtype": "Data",
    "label": "Notify Email",
-   "mandatory_depends_on": "enable_s3_backups"
+   "mandatory_depends_on": "eval:doc.enable_aws && doc.enable_s3_backups"
   },
   {
    "fieldname": "column_break_s3_backup_3",
@@ -357,7 +406,7 @@
   },
   {
    "default": "0",
-   "depends_on": "enable_s3_backups",
+   "depends_on": "eval:doc.enable_aws && doc.enable_s3_backups",
    "description": "Send email notification even when backup succeeds",
    "fieldname": "s3_backup_notify_success",
    "fieldtype": "Check",
@@ -371,7 +420,7 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-02-23 00:00:00.000000",
+ "modified": "2026-03-06 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Aws Integration",
  "name": "AWS Settings",

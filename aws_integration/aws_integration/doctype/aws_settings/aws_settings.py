@@ -31,6 +31,15 @@ class AWSSettings(Document):
                     title=_("Warning"),
                 )
 
+    def get_s3_credentials(self):
+        """Return (access_key, secret, region, endpoint_url) for S3."""
+        return (
+            self.s3_access_key_id,
+            self.get_password("s3_secret_access_key"),
+            self.s3_region or self.region,
+            self.s3_endpoint_url,
+        )
+
     def get_ses_client(self):
         aws_secret_access_key = self.get_password("aws_secret_access_key")
         return boto3.client(
@@ -41,15 +50,13 @@ class AWSSettings(Document):
         )
 
     def validate(self):
-        if self.enable_aws:
-            if not self.aws_access_key_id:
-                frappe.throw(_("AWS Access Key ID is required when AWS is enabled"))
-            if not self.aws_secret_access_key:
-                frappe.throw(_("AWS Secret Access Key is required when AWS is enabled"))
-
         if self.enable_s3:
             if not self.enable_aws:
                 frappe.throw(_("AWS must be enabled to use S3"))
+            if not self.s3_access_key_id:
+                frappe.throw(_("S3 Access Key ID is required when S3 is enabled"))
+            if not self.s3_secret_access_key:
+                frappe.throw(_("S3 Secret Access Key is required when S3 is enabled"))
             if not self.s3_bucket_name:
                 frappe.throw(_("S3 Bucket Name is required when S3 is enabled"))
             if self.s3_endpoint_url:
@@ -63,9 +70,21 @@ class AWSSettings(Document):
                     _("Presigned URL Expiry must be between 1 and 604800 seconds (7 days)")
                 )
 
+        if self.enable_bulk_ses_email:
+            if not self.enable_aws:
+                frappe.throw(_("AWS must be enabled to use Bulk SES Email"))
+            if not self.aws_access_key_id:
+                frappe.throw(_("AWS Access Key ID is required for SES Email"))
+            if not self.aws_secret_access_key:
+                frappe.throw(_("AWS Secret Access Key is required for SES Email"))
+            if not self.source_email:
+                frappe.throw(_("Source Email is required when Bulk SES Email is enabled"))
+
         if self.enable_s3_backups:
-            if not self.enable_s3 or not self.enable_aws:
-                frappe.throw(_("AWS and S3 must be enabled to use S3 Backups"))
+            if not self.enable_aws:
+                frappe.throw(_("AWS must be enabled to use S3 Backups"))
+            if not self.enable_s3:
+                frappe.throw(_("S3 must be enabled to use S3 Backups"))
             if self.s3_backup_notify_email and not validate_email(self.s3_backup_notify_email):
                 frappe.throw(_("Please enter a valid backup notification email address"))
             if self.s3_backup_retention_count and self.s3_backup_retention_count < 0:
@@ -95,6 +114,8 @@ class AWSSettings(Document):
         :param batch_size: Number of recipients per batch (default: 25).
         :return: List of message IDs or None for failed attempts.
         """
+        if not self.enable_bulk_ses_email:
+            frappe.throw(_("Bulk SES Email is not enabled in AWS Settings"))
         self.source = f"{self.sender_name} <{self.source_email}>"
         self.ses_client = self.get_ses_client()
         send_args = {

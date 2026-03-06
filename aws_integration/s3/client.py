@@ -15,13 +15,14 @@ class S3Client:
         if not self.settings.enable_aws or not self.settings.enable_s3:
             frappe.throw(_("S3 is not enabled in AWS Settings"))
 
+        access_key, secret, region, endpoint_url = self.settings.get_s3_credentials()
         client_kwargs = {
-            "region_name": self.settings.s3_bucket_region or self.settings.region,
-            "aws_access_key_id": self.settings.aws_access_key_id,
-            "aws_secret_access_key": self.settings.get_password("aws_secret_access_key"),
+            "region_name": region,
+            "aws_access_key_id": access_key,
+            "aws_secret_access_key": secret,
         }
-        if self.settings.s3_endpoint_url:
-            client_kwargs["endpoint_url"] = self.settings.s3_endpoint_url
+        if endpoint_url:
+            client_kwargs["endpoint_url"] = endpoint_url
 
         self.client = boto3.client("s3", **client_kwargs)
         self.bucket = self.settings.s3_bucket_name

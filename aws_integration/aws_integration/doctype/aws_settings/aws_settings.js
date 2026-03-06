@@ -1,7 +1,84 @@
 // Copyright (c) 2024, Hybrowlabs Technologies and contributors
 // For license information, please see license.txt
 
+function show_region_picker(frm, provider) {
+    frappe.call({
+        method: "aws_integration.api.s3.get_s3_provider_regions",
+        args: { provider: provider },
+        callback: function (r) {
+            let regions = r.message || [];
+            if (!regions.length) {
+                // MinIO, Custom — no predefined regions
+                frm.set_value("s3_endpoint_url", "");
+                return;
+            }
+            let options = regions.map((r) => r.label);
+            let region_map = {};
+            regions.forEach((r) => {
+                region_map[r.label] = r;
+            });
+
+            let d = new frappe.ui.Dialog({
+                title: __("Select {0} Region", [provider]),
+                fields: [
+                    {
+                        fieldname: "provider_region",
+                        fieldtype: "Select",
+                        label: __("Region"),
+                        options: options.join("\n"),
+                        reqd: 1,
+                    },
+                ],
+                primary_action_label: __("Set"),
+                primary_action: function (values) {
+                    let selected = region_map[values.provider_region];
+                    if (selected) {
+                        frm.set_value("s3_region", selected.region);
+                        frm.set_value("s3_endpoint_url", selected.endpoint || "");
+                    }
+                    d.hide();
+                },
+            });
+            d.show();
+        },
+    });
+}
+
 frappe.ui.form.on("AWS Settings", {
+    s3_provider: function (frm) {
+        let provider = frm.doc.s3_provider;
+        if (provider === "AWS S3" || provider === "Other") {
+            // AWS S3: boto3 handles regions/endpoints natively
+            // Other: user fills endpoint and region manually
+            frm.set_value("s3_endpoint_url", "");
+            return;
+        }
+        if (provider === "Cloudflare R2") {
+            frappe.prompt(
+                {
+                    fieldname: "account_id",
+                    fieldtype: "Data",
+                    label: __("Cloudflare Account ID"),
+                    reqd: 1,
+                },
+                function (values) {
+                    let account_id = values.account_id.trim().replace(/[^a-zA-Z0-9-]/g, "");
+                    if (!account_id) {
+                        frappe.msgprint(__("Invalid Account ID"));
+                        return;
+                    }
+                    frm.set_value(
+                        "s3_endpoint_url",
+                        `https://${account_id}.r2.cloudflarestorage.com`
+                    );
+                    frm.set_value("s3_region", "auto");
+                },
+                __("Cloudflare R2 Configuration")
+            );
+            return;
+        }
+        show_region_picker(frm, provider);
+    },
     refresh: function (frm) {
         if (frm.doc.enable_aws && frm.doc.enable_s3) {
             frm.add_custom_button(
