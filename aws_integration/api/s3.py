@@ -3,6 +3,7 @@ from urllib.parse import unquote
 
 import frappe
 from frappe import _
+from frappe.query_builder.functions import Coalesce, Count, Sum
 
 from aws_integration.s3 import get_s3_file_url
 from aws_integration.s3.handlers import _update_parent_attach_field
@@ -201,7 +202,7 @@ def get_s3_status():
     File = frappe.qb.DocType("File")
     s3_size = (
         frappe.qb.from_(File)
-        .select(frappe.qb.functions.Coalesce(frappe.qb.functions.Sum(File.file_size), 0))
+        .select(Coalesce(Sum(File.file_size), 0))
         .where(File.is_folder == 0)
         .where(File.is_on_s3 == 1)
     ).run()[0][0]
@@ -221,8 +222,7 @@ def get_s3_status():
             (File.attached_to_doctype.isnull()) | (File.attached_to_doctype.notin(exempt_doctypes))
         )
 
-    Fn = frappe.qb.functions
-    result = pending_base.select(Fn.Count("*"), Fn.Coalesce(Fn.Sum(File.file_size), 0)).run()
+    result = pending_base.select(Count("*"), Coalesce(Sum(File.file_size), 0)).run()
     pending = result[0][0]
     pending_size = result[0][1]
 
