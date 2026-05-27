@@ -3,7 +3,6 @@ from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
 
 def after_migrate():
-    """Create custom fields on File DocType for S3 integration."""
     custom_fields = {
         "File": [
             {
@@ -70,4 +69,10 @@ def after_migrate():
             },
         ]
     }
-    create_custom_fields(custom_fields, update=True)
+    # Table definition may have changed earlier in migrate; retry once to pick up the fresh schema.
+    try:
+        create_custom_fields(custom_fields, update=True)
+    except Exception:
+        frappe.db.rollback()
+        create_custom_fields(custom_fields, update=True)
+        frappe.db.commit()
