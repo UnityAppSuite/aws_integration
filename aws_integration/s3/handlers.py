@@ -7,6 +7,14 @@ from frappe.utils import now_datetime
 from aws_integration.s3 import S3_API_PREFIX, get_s3_file_url
 
 
+def _publish_system_manager_realtime(event, message):
+    """Publish realtime events only to System Managers."""
+    recipients = frappe.get_all("Has Role", filters={"role": "System Manager", "parenttype": "User"}, pluck="parent")
+    for user in set(recipients or []):
+        if user and user != "Guest":
+            frappe.publish_realtime(event, message=message, user=user)
+
+
 def on_file_upload(doc, method):
     """Upload file to S3 immediately after it's created in ERP.
 
@@ -155,7 +163,7 @@ def _upload_single_file(file_name):
         frappe.db.commit()
 
     # Notify the browser so the File form auto-refreshes with the S3 indicator
-    frappe.publish_realtime("s3_upload_complete", {"file_name": file_doc.name})
+    _publish_system_manager_realtime("s3_upload_complete", {"file_name": file_doc.name})
 
 
 def _mark_dedup_file_as_s3(doc, s3_key=None, uploaded_at=None):

@@ -4,7 +4,11 @@ import frappe
 from frappe.utils import cint, now_datetime
 
 from aws_integration.s3 import get_s3_file_url
-from aws_integration.s3.handlers import _mark_dedup_file_as_s3, _update_parent_attach_field
+from aws_integration.s3.handlers import (
+    _mark_dedup_file_as_s3,
+    _publish_system_manager_realtime,
+    _update_parent_attach_field,
+)
 
 
 def upload_pending_files():
@@ -296,14 +300,14 @@ def _update_migration_progress(migration_id, batch_uploaded, batch_failed, total
 
         frappe.cache.set_value(cache_key, progress, expires_in_sec=3600)
 
-    frappe.publish_realtime("s3_migration_progress", {
+    _publish_system_manager_realtime("s3_migration_progress", {
         "uploaded": progress["uploaded"],
         "failed": progress["failed"],
         "total": total,
     })
 
     if progress["completed_batches"] >= progress.get("total_batches", 0):
-        frappe.publish_realtime("s3_migration_complete", {
+        _publish_system_manager_realtime("s3_migration_complete", {
             "uploaded": progress["uploaded"],
             "failed": progress["failed"],
         })
@@ -382,7 +386,7 @@ def cleanup_local_s3_files():
         # Commit after each batch so progress is not lost on crash
         frappe.db.commit()
 
-        frappe.publish_realtime(
+        _publish_system_manager_realtime(
             "s3_cleanup_progress",
             {
                 "deleted": total_deleted,
@@ -395,7 +399,7 @@ def cleanup_local_s3_files():
         if len(files) < batch_size:
             break
 
-    frappe.publish_realtime(
+    _publish_system_manager_realtime(
         "s3_cleanup_complete",
         {
             "deleted": total_deleted,
@@ -468,7 +472,7 @@ def adopt_orphaned_files():
                         adopted += a
                         errors += e
                         batch.clear()
-                        frappe.publish_realtime(
+                        _publish_system_manager_realtime(
                             "s3_orphan_progress",
                             {"adopted": adopted, "errors": errors},
                         )
@@ -486,7 +490,7 @@ def adopt_orphaned_files():
     finally:
         frappe.cache.delete_value(lock_key)
         frappe.db.commit()
-        frappe.publish_realtime(
+        _publish_system_manager_realtime(
             "s3_orphan_complete",
             {"adopted": adopted, "errors": errors},
         )
