@@ -8,8 +8,8 @@ sends, through *any* app, not just ``aws_integration``:
 
   1. ``X-SES-Configuration-Set`` — tells AWS SES which configuration set
      (i.e. which event-publishing/reputation bucket) a send belongs to.
-  2. ``List-Unsubscribe`` (and, NOT YET — see "DEFERRED" below —
-     ``List-Unsubscribe-Post``) — the standard mail-client-recognised
+  2. ``List-Unsubscribe`` and ``List-Unsubscribe-Post`` (RFC 8058 one-click
+     — see "IMPLEMENTED" below) — the standard mail-client-recognised
      unsubscribe affordance, but ONLY for sends a caller has explicitly
      opted in as "promotional".
 
@@ -111,7 +111,7 @@ configuration set on this bench's real AWS account has NOT been verified
 here — flagged as **needs-Badal-confirmation** once real config set names
 are filled into AWS Settings and a real send is traced.
 
-DEFERRED: RFC 8058 one-click ``List-Unsubscribe-Post`` (do NOT add yet)
+IMPLEMENTED: RFC 8058 one-click ``List-Unsubscribe-Post`` (Part 5)
 --------------------------------------------------------------------------
 Full RFC 8058 one-click unsubscribe requires the mail client to be able to
 ``POST`` to the URL in ``List-Unsubscribe`` with body
@@ -119,28 +119,23 @@ Full RFC 8058 one-click unsubscribe requires the mail client to be able to
 Core Frappe's built-in unsubscribe endpoint
 (``frappe.email.queue.unsubscribe``, in ``frappe/email/queue.py``) calls
 ``verify_request()`` (``frappe.utils.verified_command``), which validates a
-*signed query string* — it does not accept or process a POST body at all,
-so a compliant mail client's one-click POST against it would not actually
-register an unsubscribe. Advertising ``List-Unsubscribe-Post: List-Unsubscribe=One-Click``
-against an endpoint that cannot honor it is worse than not advertising it:
-mail clients (Gmail, etc.) treat a successful POST as silent, immediate
-proof of unsubscribe and give the user no further feedback — a broken POST
-here would either error visibly (bad) or, worse, appear to succeed to the
-client while nothing was actually recorded server-side (silently broken,
-which is far worse for a compliance-sensitive feature).
+*signed query string* and explicitly rejects any request carrying a POST
+body/form data (``valid_request_data = not (frappe.request.form or
+frappe.request.data)``) — so a compliant mail client's one-click POST
+against it would never actually register. Advertising
+``List-Unsubscribe-Post: List-Unsubscribe=One-Click`` against an endpoint
+that cannot honor it would be worse than not advertising it at all.
 
-Per the email-governance-engine plan, Part 3 introduces an
-``aws_integration``-owned ``Email Suppression Entry`` doctype — a real
-place to persist "this address opted out" — and, alongside it, a real
-``allow_guest=True`` POST-accepting endpoint that can genuinely honor
-one-click unsubscribe. THIS module therefore only ever sets
-``List-Unsubscribe`` (RFC 2369-style: an ``https:`` link — using core's
-existing GET-based endpoint, since that's a real, restrictive service
-boundary that already exists — and a ``mailto:`` fallback), and
-deliberately never sets ``List-Unsubscribe-Post``. That decision is
-mechanical: search this file for ``List-Unsubscribe-Post`` and there is no
-code path that sets it. Wiring it up is Part 3's job, once the POST
-receiver exists to answer it correctly.
+Part 3 introduced this app's own ``Email Suppression Entry`` doctype and
+``aws_integration.utils.suppression.suppress()``. Part 5 (this change)
+adds the missing piece: a genuinely POST-accepting, signed-token-gated
+receiver — ``aws_integration.api.unsubscribe.one_click_unsubscribe`` (see
+that module and ``aws_integration.utils.unsubscribe_token`` for the full
+design) — and this module now points ``List-Unsubscribe`` at it and sets
+``List-Unsubscribe-Post`` alongside it. The unsubscribe URL is now signed
+with this app's own stateless token (not core's ``get_unsubcribed_url()``,
+which mints links only core's GET-only endpoint understands) so the same
+link that's advertised is the one the new receiver actually understands.
 
 KNOWN LIMITATION: List-Unsubscribe URL is per-MESSAGE, not per-RECIPIENT
 --------------------------------------------------------------------------
@@ -190,7 +185,9 @@ import email.utils
 
 import frappe
 from frappe import _
-from frappe.email.queue import get_unsubcribed_url
+from frappe.utils import get_url
+
+from aws_integration.utils.unsubscribe_token import generate_unsubscribe_token
 
 #: Marker headers used to smuggle caller intent from
 #: ``aws_integration.utils.email.sendmail(..., promotional=True)`` through
@@ -200,10 +197,9 @@ PROMOTIONAL_HEADER = "X-Aws-Promotional"
 UNSUB_DOCTYPE_HEADER = "X-Aws-Unsub-Doctype"
 UNSUB_NAME_HEADER = "X-Aws-Unsub-Name"
 
-#: Core Frappe's existing GET-only unsubscribe endpoint. See module
-#: docstring "DEFERRED" section for why this is RFC 2369, not RFC 8058,
-#: for now.
-UNSUBSCRIBE_METHOD = "/api/method/frappe.email.queue.unsubscribe"
+#: This app's RFC 8058 one-click unsubscribe POST receiver. See module
+#: docstring "IMPLEMENTED" section and ``aws_integration.api.unsubscribe``.
+ONE_CLICK_UNSUBSCRIBE_METHOD = "/api/method/aws_integration.api.unsubscribe.one_click_unsubscribe"
 
 
 def mark_promotional_headers(reference_doctype=None, reference_name=None):
@@ -216,11 +212,9 @@ def mark_promotional_headers(reference_doctype=None, reference_name=None):
     why that is a deliberate, hard requirement, not a convenience default.
 
     :param reference_doctype: Optional. If given (together with
-        ``reference_name``), lets the hook build a working ``https:``
-        List-Unsubscribe link via core's existing unsubscribe endpoint,
-        which requires a doctype+name to record the opt-out against. If
-        omitted, the hook still adds a ``mailto:`` fallback only — see
-        the module docstring's "DEFERRED" / limitation notes.
+        ``reference_name``), scopes the resulting unsubscribe token (and
+        eventual suppression) to that one reference instead of a global
+        unsubscribe — see ``aws_integration.utils.unsubscribe_token``.
     :param reference_name: See ``reference_doctype``.
     """
     headers = {"Aws-Promotional": "1"}
@@ -287,9 +281,9 @@ def _mailto_fallback_address(mail):
 
 
 def _inject_list_unsubscribe_headers(mail, is_promotional, unsub_doctype, unsub_name):
-    """Set ``List-Unsubscribe`` ONLY for sends explicitly marked
-    promotional. Never sets ``List-Unsubscribe-Post`` — see module
-    docstring "DEFERRED" section."""
+    """Set ``List-Unsubscribe`` (and, when an https: link was built,
+    ``List-Unsubscribe-Post``) ONLY for sends explicitly marked
+    promotional. See module docstring "IMPLEMENTED" section."""
     if not is_promotional:
         return
 
@@ -308,17 +302,22 @@ def _inject_list_unsubscribe_headers(mail, is_promotional, unsub_doctype, unsub_
     recipient = recipients[0] if recipients else None
 
     parts = []
+    https_link_added = False
 
-    if unsub_doctype and unsub_name and recipient:
+    if recipient:
+        # reference_doctype/reference_name are optional here (unlike the
+        # old core-endpoint path, which required both) — a token minted
+        # with neither decodes, at receiver time, to a global unsubscribe.
+        # See aws_integration.utils.unsubscribe_token module docstring.
         try:
-            https_url = get_unsubcribed_url(
+            token = generate_unsubscribe_token(
+                recipient_email=recipient,
                 reference_doctype=unsub_doctype,
                 reference_name=unsub_name,
-                email=recipient,
-                unsubscribe_method=UNSUBSCRIBE_METHOD,
-                unsubscribe_params=None,
             )
+            https_url = get_url(f"{ONE_CLICK_UNSUBSCRIBE_METHOD}?token={token}")
             parts.append(f"<{https_url}>")
+            https_link_added = True
         except Exception:
             frappe.log_error(
                 title=_("aws_integration: failed to build List-Unsubscribe https: link"),
@@ -326,11 +325,9 @@ def _inject_list_unsubscribe_headers(mail, is_promotional, unsub_doctype, unsub_
             )
     else:
         frappe.logger("aws_integration").info(
-            "inject_governance_headers(): promotional send %r missing "
-            "reference_doctype/reference_name and/or a single resolvable "
+            "inject_governance_headers(): promotional send %r has no resolvable "
             "recipient — omitting the https: List-Unsubscribe form, mailto: "
-            "fallback only. Pass reference_doctype/reference_name to "
-            "sendmail(..., promotional=True) to enable the https form.",
+            "fallback only.",
             mail.subject,
         )
 
@@ -340,9 +337,12 @@ def _inject_list_unsubscribe_headers(mail, is_promotional, unsub_doctype, unsub_
 
     if parts:
         mail.set_header("List-Unsubscribe", ", ".join(parts))
-    # List-Unsubscribe-Post (RFC 8058 one-click) is INTENTIONALLY not set
-    # here. See module docstring "DEFERRED" section — Part 3 builds the
-    # POST-accepting endpoint this would need to point at.
+
+    if https_link_added:
+        # RFC 8058 one-click — only advertised when the https: link actually
+        # points at our POST-accepting receiver (never for the mailto:-only
+        # fallback case, which no mail client can one-click POST to).
+        mail.set_header("List-Unsubscribe-Post", "List-Unsubscribe=One-Click")
 
 
 def inject_governance_headers(mail):

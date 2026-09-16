@@ -144,32 +144,64 @@ class TestListUnsubscribeInjectionGatedOnMarker(FrappeTestCase):
         )
         with _settings_patch():
             with mock.patch(
-                "aws_integration.utils.email_headers.get_unsubcribed_url",
-                return_value="https://site.test/api/method/frappe.email.queue.unsubscribe?x=1",
-            ) as mock_url:
+                "aws_integration.utils.email_headers.generate_unsubscribe_token",
+                return_value="TOKEN123",
+            ) as mock_token:
                 inject_governance_headers(mail)
 
-        mock_url.assert_called_once()
-        call_kwargs = mock_url.call_args.kwargs
+        mock_token.assert_called_once()
+        call_kwargs = mock_token.call_args.kwargs
         self.assertEqual(call_kwargs["reference_doctype"], "Notification Log")
         self.assertEqual(call_kwargs["reference_name"], "NL-1")
-        self.assertEqual(call_kwargs["email"], "parent@example.com")
+        self.assertEqual(call_kwargs["recipient_email"], "parent@example.com")
 
         header = mail.msg_root["List-Unsubscribe"]
-        self.assertIn("<https://site.test/api/method/frappe.email.queue.unsubscribe?x=1>", header)
+        self.assertIn("aws_integration.api.unsubscribe.one_click_unsubscribe", header)
+        self.assertIn("token=TOKEN123", header)
         self.assertIn("mailto:notifications@unityedu.test", header)
+        # RFC 8058 one-click header must accompany a genuine https: link.
+        self.assertEqual(mail.msg_root["List-Unsubscribe-Post"], "List-Unsubscribe=One-Click")
 
-    def test_promotional_send_without_reference_gets_mailto_only(self):
+    def test_promotional_send_without_reference_still_gets_global_https_link(self):
+        # Unlike the old core-endpoint path, reference_doctype/name are no
+        # longer required to build the https: link — an unscoped token
+        # decodes to a global unsubscribe at receiver time. See
+        # unsubscribe_token module docstring.
         mail = _FakeEMail(recipients=["parent@example.com"])
         _apply_marker_headers(mail, mark_promotional_headers())  # no doctype/name
         with _settings_patch():
-            with mock.patch("aws_integration.utils.email_headers.get_unsubcribed_url") as mock_url:
+            with mock.patch(
+                "aws_integration.utils.email_headers.generate_unsubscribe_token",
+                return_value="TOKEN456",
+            ) as mock_token:
                 inject_governance_headers(mail)
 
-        mock_url.assert_not_called()
+        mock_token.assert_called_once()
+        call_kwargs = mock_token.call_args.kwargs
+        self.assertIsNone(call_kwargs["reference_doctype"])
+        self.assertIsNone(call_kwargs["reference_name"])
+
+        header = mail.msg_root["List-Unsubscribe"]
+        self.assertIn("token=TOKEN456", header)
+        self.assertIn("mailto:notifications@unityedu.test", header)
+        self.assertEqual(mail.msg_root["List-Unsubscribe-Post"], "List-Unsubscribe=One-Click")
+
+    def test_promotional_send_with_no_recipient_gets_mailto_only_and_no_post_header(self):
+        mail = _FakeEMail(recipients=[])
+        _apply_marker_headers(
+            mail, mark_promotional_headers(reference_doctype="Notification Log", reference_name="NL-1")
+        )
+        with _settings_patch():
+            with mock.patch(
+                "aws_integration.utils.email_headers.generate_unsubscribe_token"
+            ) as mock_token:
+                inject_governance_headers(mail)
+
+        mock_token.assert_not_called()
         header = mail.msg_root["List-Unsubscribe"]
         self.assertNotIn("https://", header)
         self.assertIn("mailto:notifications@unityedu.test", header)
+        self.assertNotIn("List-Unsubscribe-Post", mail.msg_root)
 
     def test_promotional_send_with_multiple_recipients_still_works_and_warns(self):
         # Known limitation (documented in the module): the URL is only
@@ -181,29 +213,14 @@ class TestListUnsubscribeInjectionGatedOnMarker(FrappeTestCase):
         )
         with _settings_patch():
             with mock.patch(
-                "aws_integration.utils.email_headers.get_unsubcribed_url",
-                return_value="https://site.test/unsub",
-            ) as mock_url:
+                "aws_integration.utils.email_headers.generate_unsubscribe_token",
+                return_value="TOKEN789",
+            ) as mock_token:
                 inject_governance_headers(mail)
 
         # Only signed for the first recipient — documented limitation.
-        self.assertEqual(mock_url.call_args.kwargs["email"], "a@example.com")
+        self.assertEqual(mock_token.call_args.kwargs["recipient_email"], "a@example.com")
         self.assertIn("List-Unsubscribe", mail.msg_root)
-
-    def test_list_unsubscribe_post_is_never_set(self):
-        # RFC 8058 one-click is deliberately deferred to Part 3 — see
-        # module docstring "DEFERRED" section.
-        mail = _FakeEMail(recipients=["parent@example.com"])
-        _apply_marker_headers(
-            mail, mark_promotional_headers(reference_doctype="Notification Log", reference_name="NL-1")
-        )
-        with _settings_patch():
-            with mock.patch(
-                "aws_integration.utils.email_headers.get_unsubcribed_url",
-                return_value="https://site.test/unsub",
-            ):
-                inject_governance_headers(mail)
-        self.assertNotIn("List-Unsubscribe-Post", mail.msg_root)
 
     def test_unsubscribe_url_build_failure_does_not_raise_or_block_mailto(self):
         mail = _FakeEMail(recipients=["parent@example.com"])
@@ -212,7 +229,7 @@ class TestListUnsubscribeInjectionGatedOnMarker(FrappeTestCase):
         )
         with _settings_patch():
             with mock.patch(
-                "aws_integration.utils.email_headers.get_unsubcribed_url",
+                "aws_integration.utils.email_headers.generate_unsubscribe_token",
                 side_effect=Exception("signing blew up"),
             ):
                 # Must not raise — this hook must never break mail sending.
@@ -220,6 +237,9 @@ class TestListUnsubscribeInjectionGatedOnMarker(FrappeTestCase):
         header = mail.msg_root["List-Unsubscribe"]
         self.assertIn("mailto:", header)
         self.assertNotIn("https://", header)
+        # https link failed to build, so the one-click POST header must not
+        # be advertised either — nothing to POST to.
+        self.assertNotIn("List-Unsubscribe-Post", mail.msg_root)
 
 
 class TestConfigurationSetInjection(FrappeTestCase):

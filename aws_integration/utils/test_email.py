@@ -151,6 +151,77 @@ class TestSendmailSignatureCompatibility(FrappeTestCase):
         self.assertEqual(kwargs["recipients"], ["parent@example.com"])
 
 
+class TestSendmailHalfScopedReferenceGuard(FrappeTestCase):
+    """disposer Fix 1, layer 2 — sendmail() itself must reject a half-scoped
+    (reference_doctype, reference_name) pair as early as possible, before it
+    ever reaches mark_promotional_headers()/email_headers.py. Without this,
+    a direct sendmail(..., promotional=True, reference_doctype="Student")
+    call (reference_name omitted) would silently flow through as a GLOBAL
+    unsubscribe once the message actually gets built."""
+
+    def setUp(self):
+        self.settings_patch = _patch_aws_settings()
+        self.settings_patch.start()
+        self.addCleanup(self.settings_patch.stop)
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_doctype_without_name_raises_and_does_not_call_core_sendmail(self, mock_sendmail):
+        with self.assertRaises(frappe.ValidationError):
+            sendmail(
+                "Subject",
+                "Body",
+                ["a@example.com"],
+                None,
+                None,
+                promotional=True,
+                reference_doctype="Student",
+            )
+        mock_sendmail.assert_not_called()
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_name_without_doctype_raises_and_does_not_call_core_sendmail(self, mock_sendmail):
+        with self.assertRaises(frappe.ValidationError):
+            sendmail(
+                "Subject",
+                "Body",
+                ["a@example.com"],
+                None,
+                None,
+                promotional=True,
+                reference_name="STU-0001",
+            )
+        mock_sendmail.assert_not_called()
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_fully_paired_reference_still_sends(self, mock_sendmail):
+        # Regression guard — a properly-paired reference must still work.
+        sendmail(
+            "Subject",
+            "Body",
+            ["a@example.com"],
+            None,
+            None,
+            promotional=True,
+            reference_doctype="Student",
+            reference_name="STU-0001",
+        )
+        mock_sendmail.assert_called_once()
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_fully_global_both_empty_still_sends(self, mock_sendmail):
+        # Regression guard — the legitimate global-unsubscribe path (both
+        # reference_doctype and reference_name omitted) must not be broken.
+        sendmail(
+            "Subject",
+            "Body",
+            ["a@example.com"],
+            None,
+            None,
+            promotional=True,
+        )
+        mock_sendmail.assert_called_once()
+
+
 class TestSendmailRoutesThroughCore(FrappeTestCase):
     """Verify sendmail() calls Frappe core's frappe.sendmail() with the
     right translation of arguments — this is the actual Route B -> Route A

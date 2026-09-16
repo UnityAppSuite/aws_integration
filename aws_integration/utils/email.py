@@ -328,6 +328,27 @@ def sendmail(
         fault-tolerant, "one bad row doesn't block the rest" behavior the
         existing callers rely on.
     """
+    # REVISION (disposer Fix 1) — second, earlier layer of the same
+    # half-scoped-reference guard also enforced in
+    # ``unsubscribe_token.generate_unsubscribe_token()``. Catching a caller's
+    # mistake here — right at the public entrypoint every direct
+    # ``sendmail()`` call goes through — gives a more actionable error
+    # (naming this function, not the internal token module three layers
+    # down) and rejects it before it ever reaches ``mark_promotional_headers()``
+    # / ``email_headers.py`` at all. reference_doctype/reference_name must be
+    # given together (a fully-scoped reference) or both omitted (a global
+    # send) — never exactly one, which would otherwise silently decode, at
+    # the unsubscribe receiver, to a GLOBAL unsubscribe instead of the
+    # caller's intended scoped one.
+    if bool(reference_doctype) != bool(reference_name):
+        frappe.throw(
+            _(
+                "reference_doctype and reference_name must both be provided together, "
+                "or both left empty — got only one of them (reference_doctype={0}, "
+                "reference_name={1})."
+            ).format(reference_doctype, reference_name)
+        )
+
     recipients = _as_address_list(recepient)
     cc = _as_address_list(cc_recepient)
     bcc = _as_address_list(bcc_recepient)
