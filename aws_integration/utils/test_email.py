@@ -28,6 +28,7 @@ from aws_integration.utils.email import (
     send_email_in_batches,
     validate_email,
 )
+from aws_integration.utils.suppression import suppress
 
 
 def _fake_settings(source_email="notifications@unityedu.test", sender_name="Unity Notices"):
@@ -475,6 +476,244 @@ class TestAWSSettingsSendEmailDeprecated(FrappeTestCase):
                 subject="Subject",
                 content="Body",
             )
+
+
+class TestSendmailSuppressionGate(FrappeTestCase):
+    """PART 3 — email-governance-engine suppression gate integration.
+
+    Verifies the precise distinction the task calls out: all-suppressed
+    -> quiet no-op (no throw, core frappe.sendmail() never called); a
+    genuinely empty recipient list for any OTHER reason -> the pre-existing
+    frappe.throw() behavior is unchanged; and partial suppression filters
+    only the suppressed addresses out of recipients/cc/bcc, leaving the
+    unsuppressed ones untouched.
+    """
+
+    def setUp(self):
+        self.settings_patch = _patch_aws_settings()
+        self.settings_patch.start()
+        self.addCleanup(self.settings_patch.stop)
+
+    def tearDown(self):
+        frappe.db.delete("Email Suppression Entry", {"recipient_email": ["like", "%@example.com"]})
+        frappe.db.delete("Email Unsubscribe", {"email": ["like", "%@example.com"]})
+        super().tearDown()
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_all_recipients_suppressed_is_a_quiet_no_op(self, mock_sendmail):
+        suppress("only@example.com", reason="Hard Bounce", is_global=True)
+
+        result = sendmail("Subject", "Body", ["only@example.com"], None, None)
+
+        self.assertIsNone(result)
+        mock_sendmail.assert_not_called()
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_all_suppressed_no_op_logs_the_actual_addresses(self, mock_sendmail):
+        # OBSERVABILITY FIX (post-review): the no-op log line must carry the
+        # actual suppressed addresses, not just a count, so an admin can
+        # grep the log for a specific address ("why didn't Student X get
+        # this notice").
+        suppress("only@example.com", reason="Hard Bounce", is_global=True)
+        suppress("second@example.com", reason="Complaint", is_global=True)
+
+        with mock.patch("aws_integration.utils.email.frappe.logger") as mock_logger:
+            log_instance = mock_logger.return_value
+            result = sendmail(
+                "Subject", "Body", ["only@example.com", "second@example.com"], None, None
+            )
+
+        self.assertIsNone(result)
+        mock_sendmail.assert_not_called()
+        self.assertTrue(log_instance.info.called)
+        logged_args = log_instance.info.call_args[0]
+        # Last positional arg is the suppressed-addresses list interpolated
+        # into the log format string.
+        logged_addresses = logged_args[-1]
+        self.assertIn("only@example.com", logged_addresses)
+        self.assertIn("second@example.com", logged_addresses)
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_genuinely_empty_recipient_input_still_throws(self, mock_sendmail):
+        # No suppression involved at all here — this is the pre-existing
+        # "caller passed nothing" case, which must still raise.
+        with self.assertRaises(frappe.ValidationError):
+            sendmail("Subject", "Body", None, None, None)
+        mock_sendmail.assert_not_called()
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_genuinely_empty_recipient_list_still_throws(self, mock_sendmail):
+        with self.assertRaises(frappe.ValidationError):
+            sendmail("Subject", "Body", [], None, None)
+        mock_sendmail.assert_not_called()
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_partial_suppression_filters_only_suppressed_addresses(self, mock_sendmail):
+        suppress("bad@example.com", reason="Complaint", is_global=True)
+
+        sendmail(
+            "Subject",
+            "Body",
+            ["good@example.com", "bad@example.com"],
+            ["bad@example.com", "goodcc@example.com"],
+            ["goodbcc@example.com"],
+        )
+
+        kwargs = mock_sendmail.call_args.kwargs
+        self.assertEqual(kwargs["recipients"], ["good@example.com"])
+        self.assertEqual(kwargs["cc"], ["goodcc@example.com"])
+        self.assertEqual(kwargs["bcc"], ["goodbcc@example.com"])
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_scoped_suppression_only_applies_within_matching_scope(self, mock_sendmail):
+        suppress(
+            "scoped@example.com",
+            reason="Unsubscribe",
+            reference_doctype="DocType",
+            reference_name="User",
+        )
+
+        # Same address, different reference scope -> not suppressed here.
+        sendmail(
+            "Subject",
+            "Body",
+            ["scoped@example.com"],
+            None,
+            None,
+            reference_doctype="DocType",
+            reference_name="Role",
+        )
+        kwargs = mock_sendmail.call_args.kwargs
+        self.assertEqual(kwargs["recipients"], ["scoped@example.com"])
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_no_suppression_entries_behaves_exactly_as_before(self, mock_sendmail):
+        sendmail("Subject", "Body", ["clean@example.com"], ["cleancc@example.com"], None)
+        kwargs = mock_sendmail.call_args.kwargs
+        self.assertEqual(kwargs["recipients"], ["clean@example.com"])
+        self.assertEqual(kwargs["cc"], ["cleancc@example.com"])
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_cc_only_suppressed_does_not_trigger_no_op_path(self, mock_sendmail):
+        # Only the To list controls the no-op path (matching the
+        # pre-existing "at least one recipient" semantics, which never
+        # looked at cc/bcc either) — a fully-suppressed cc with a clean To
+        # must still send normally, just with cc filtered out.
+        suppress("ccbad@example.com", reason="Manual", is_global=True)
+
+        sendmail("Subject", "Body", ["good@example.com"], ["ccbad@example.com"], None)
+
+        kwargs = mock_sendmail.call_args.kwargs
+        self.assertEqual(kwargs["recipients"], ["good@example.com"])
+        self.assertEqual(kwargs["cc"], [])
+
+
+class TestSendEmailInBatchesReferenceNameDefault(FrappeTestCase):
+    """PART 3 — send_email_in_batches() defaults reference_name to the
+    item's own dict key when reference_doctype is set but reference_name
+    is not."""
+
+    def setUp(self):
+        self.settings_patch = _patch_aws_settings()
+        self.settings_patch.start()
+        self.addCleanup(self.settings_patch.stop)
+
+        self.sleep_patch = mock.patch("aws_integration.utils.email.time.sleep")
+        self.mock_sleep = self.sleep_patch.start()
+        self.addCleanup(self.sleep_patch.stop)
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_batch_level_reference_doctype_defaults_reference_name_to_item_key(
+        self, mock_sendmail
+    ):
+        # NOTE: the dict key doubles as the reference_name the fallback
+        # will default to (see send_email_in_batches docstring point 3), so
+        # it must itself be a real DocType name for the Dynamic Link
+        # validation on the Email Unsubscribe dual-write (below) to accept
+        # it — "User" is used here purely as a valid, always-present
+        # DocType name, not because the reference is semantically a User.
+        data = {
+            "User": {
+                "subject": "Sub",
+                "content": "Body",
+                "recepients": ["parent100@example.com"],
+                "cc_recepients": [],
+                "bcc_recepients": [],
+            },
+        }
+        with mock.patch("aws_integration.utils.email.frappe.get_value", return_value=5):
+            send_email_in_batches(data, reference_doctype="DocType")
+
+        # reference_doctype/reference_name aren't passed to core
+        # frappe.sendmail() directly (see email_headers.py docstring) but
+        # DO drive the suppression-scope lookup inside sendmail(); assert
+        # indirectly via the suppression gate actually scoping correctly.
+        suppress(
+            "parent100@example.com",
+            reason="Manual",
+            reference_doctype="DocType",
+            reference_name="User",
+        )
+        mock_sendmail.reset_mock()
+        with mock.patch("aws_integration.utils.email.frappe.get_value", return_value=5):
+            send_email_in_batches(data, reference_doctype="DocType")
+        # Suppressed for exactly the defaulted reference_name ("User", the
+        # item's own dict key) -> all-suppressed no-op -> sendmail()
+        # returns without calling core.
+        mock_sendmail.assert_not_called()
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_per_item_reference_name_override_is_not_clobbered(self, mock_sendmail):
+        data = {
+            "Role": {
+                "subject": "Sub",
+                "content": "Body",
+                "recepients": ["parent200@example.com"],
+                "cc_recepients": [],
+                "bcc_recepients": [],
+                "reference_name": "EXPLICIT-NAME",
+            },
+        }
+        suppress(
+            "parent200@example.com",
+            reason="Manual",
+            reference_doctype="DocType",
+            reference_name="Role",
+        )
+        with mock.patch("aws_integration.utils.email.frappe.get_value", return_value=5):
+            send_email_in_batches(data, reference_doctype="DocType")
+
+        # Suppression was recorded against reference_name="Role" (what the
+        # fallback default WOULD have used, from the dict key), but the
+        # item explicitly overrides reference_name to "EXPLICIT-NAME", so
+        # the scope no longer matches -> not suppressed -> core
+        # frappe.sendmail() IS called.
+        mock_sendmail.assert_called_once()
+
+    def tearDown(self):
+        frappe.db.delete(
+            "Email Suppression Entry", {"recipient_email": ["like", "%@example.com"]}
+        )
+        frappe.db.delete("Email Unsubscribe", {"email": ["like", "%@example.com"]})
+        super().tearDown()
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_no_reference_doctype_leaves_reference_name_none(self, mock_sendmail):
+        # No reference_doctype at all -> the default must NOT kick in;
+        # behaves exactly as Part 1/2 (reference_name stays whatever the
+        # item/default gave, i.e. None here).
+        data = {
+            "s1": {
+                "subject": "Sub",
+                "content": "Body",
+                "recepients": ["s1@example.com"],
+                "cc_recepients": [],
+                "bcc_recepients": [],
+            },
+        }
+        with mock.patch("aws_integration.utils.email.frappe.get_value", return_value=5):
+            send_email_in_batches(data)
+        mock_sendmail.assert_called_once()
 
 
 if __name__ == "__main__":

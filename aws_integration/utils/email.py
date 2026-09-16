@@ -14,6 +14,9 @@ from frappe.utils import now_datetime
 from frappe.utils import validate_email_address as _frappe_validate_email_address
 
 from aws_integration.utils.email_headers import mark_promotional_headers
+from aws_integration.aws_integration.doctype.email_suppression_entry.email_suppression_entry import (
+    get_suppressed_emails,
+)
 
 
 class SESDestination:
@@ -199,6 +202,42 @@ def sendmail(
 ):
     """Send a single email.
 
+    PART 3 ADDITION — email-governance-engine suppression gate
+    -------------------------------------------------------------
+    Immediately after the recepient/cc/bcc lists are normalized into plain
+    lists (``_as_address_list()``) and BEFORE the "at least one recipient"
+    check below, every address across all three lists is checked against
+    ``Email Suppression Entry`` (``aws_integration.aws_integration.doctype.
+    email_suppression_entry.get_suppressed_emails()`` — one query, not N+1)
+    scoped to this call's ``reference_doctype``/``reference_name`` (or
+    globally suppressed, regardless of scope). Any suppressed address is
+    silently dropped from whichever of ``recipients``/``cc``/``bcc`` it was
+    in before the send is ever attempted.
+
+    This is a real bug fix to the "no recipient" check, not just an
+    addition: if ``recipients`` (the To list) was non-empty before
+    suppression filtering but becomes empty because every one of them was
+    suppressed, this is treated as a quiet, successful no-op — logged at
+    info level, no ``frappe.throw()`` — since "every intended recipient
+    opted out / bounced / complained" is an expected, non-exceptional
+    outcome of a governance-aware system, not a caller error. If
+    ``recipients`` was empty for any OTHER reason (the caller genuinely
+    passed no recipient to begin with), the pre-existing
+    ``frappe.throw()`` behavior is unchanged — that is still a caller bug.
+    ``cc``/``bcc`` suppression is applied the same way but never triggers
+    the no-op path by itself (only the To list does, matching the
+    pre-existing "at least one recipient" semantics, which never looked at
+    cc/bcc either).
+
+    No ``AWS SES Logs`` row is written for the all-suppressed no-op case:
+    that doctype's ``status`` Select only has ``Not Sent``/``Sent``, both of
+    which already carry a specific meaning (attempted-and-failed /
+    attempted-and-enqueued) that "never attempted, intentionally skipped"
+    would conflate with. Extending that Select is a plausible follow-up but
+    is a schema change to an unrelated doctype outside Part 3's stated
+    scope (``Email Suppression Entry`` only) — flagged for the disposer
+    rather than done unilaterally here.
+
     PART 2 ADDITION — email-governance-engine header injection
     -------------------------------------------------------------
     ``promotional`` (default ``False``, i.e. safe/opt-in — see
@@ -294,7 +333,42 @@ def sendmail(
     bcc = _as_address_list(bcc_recepient)
     reply_tos = _as_address_list(reply_tos)
 
+    # PART 3 — suppression gate. See docstring above for the "quiet
+    # no-op when everyone was suppressed" vs. "throw on genuinely-empty
+    # input" distinction this deliberately preserves/changes.
+    recipients_before_suppression = list(recipients)
+    all_addresses = list({*recipients, *cc, *bcc})
+    suppressed = set()
+    if all_addresses:
+        suppressed = set(
+            get_suppressed_emails(
+                all_addresses, reference_doctype=reference_doctype, reference_name=reference_name
+            )
+        )
+        if suppressed:
+            recipients = [addr for addr in recipients if addr not in suppressed]
+            cc = [addr for addr in cc if addr not in suppressed]
+            bcc = [addr for addr in bcc if addr not in suppressed]
+
     if not recipients:
+        if recipients_before_suppression:
+            # OBSERVABILITY FIX (post-review): log the actual suppressed
+            # addresses (from the To list specifically — the ones that
+            # caused this no-op), not just a count, so an admin
+            # investigating "why didn't Student X get this notice" can
+            # grep the log for the address itself.
+            suppressed_recipients = sorted(
+                addr for addr in recipients_before_suppression if addr in suppressed
+            )
+            frappe.logger("aws_integration").info(
+                "sendmail(): all %d recipient(s) for subject %r were suppressed "
+                "(Email Suppression Entry / Email Unsubscribe) — skipping send, "
+                "not an error. Suppressed addresses: %s",
+                len(recipients_before_suppression),
+                subject,
+                suppressed_recipients,
+            )
+            return None
         frappe.throw(_("At least one recipient email address is required to send an email."))
 
     invalid = [addr for addr in (*recipients, *cc, *bcc) if not validate_email(addr)]
@@ -401,6 +475,22 @@ def send_email_in_batches(data, promotional=False, reference_doctype=None, refer
          the structure comment above, which already documented it) but
          never read it — a latent bug. Fixed here since it costs nothing to
          fix and matches the documented contract.
+      3. PART 3 ADDITION — ``reference_name`` convenience default: if a
+         ``reference_doctype`` is set (batch-level default or per-item
+         override) but ``reference_name`` is not, ``reference_name``
+         defaults to the item's own dict key (the ``key`` this loop already
+         iterates over). Real callers in this bench (edu_quality's and
+         unity_parent_app's School Notice functions) key their per-item
+         dicts by Student ID but do not currently pass ``reference_name``
+         explicitly — this means, once those callers are updated (separate,
+         not-yet-authorized work, out of Part 3's scope) to pass only
+         ``reference_doctype="Student"`` at the batch level, per-item
+         suppression scoping (and List-Unsubscribe scoping, Part 2) works
+         automatically without every call site also having to thread
+         ``reference_name`` through by hand. This default only fires when
+         ``reference_doctype`` is set and ``reference_name`` is not — a
+         batch with no reference_doctype at all (the common case today)
+         behaves exactly as before.
       2. Each item is now wrapped in its own try/except. ``sendmail()`` can
          raise synchronously now (see its docstring) where the old boto3
          path never did; this restores the "one bad row doesn't abort the
@@ -415,6 +505,13 @@ def send_email_in_batches(data, promotional=False, reference_doctype=None, refer
     for group in chunk(list(data.keys()), email_batch_size):
         for key in group:
             item = data[key]
+            item_reference_doctype = item.get("reference_doctype", reference_doctype)
+            item_reference_name = item.get("reference_name", reference_name)
+            if item_reference_doctype and not item_reference_name:
+                # PART 3 — see docstring point 3: default reference_name to
+                # this item's own dict key when a reference_doctype is set
+                # but no explicit reference_name was given.
+                item_reference_name = key
             try:
                 sendmail(
                     item.get("subject"),
@@ -424,8 +521,8 @@ def send_email_in_batches(data, promotional=False, reference_doctype=None, refer
                     item.get("bcc_recepients"),
                     item.get("reply_tos"),
                     promotional=item.get("promotional", promotional),
-                    reference_doctype=item.get("reference_doctype", reference_doctype),
-                    reference_name=item.get("reference_name", reference_name),
+                    reference_doctype=item_reference_doctype,
+                    reference_name=item_reference_name,
                 )
             except Exception:
                 frappe.log_error(
