@@ -202,6 +202,29 @@ def sendmail(
 ):
     """Send a single email.
 
+    ISS-13 — CC/BCC duplication above core's 100-recipient auto-split
+    -------------------------------------------------------------------
+    When the "To" list (``recipients``) is large enough to trigger Frappe
+    core's own per-recipient auto-split (``len(final_recipients) > 100``,
+    see ``frappe/email/doctype/email_queue/email_queue.py``
+    ``QueueBuilder.process()`` ~line 766) AND ``cc``/``bcc`` is non-empty,
+    every cc/bcc address would otherwise receive one copy of the message
+    per "To" recipient instead of one copy total — see
+    ``send_emails()`` ~line 795-809, which re-attaches the *full* cc+bcc
+    list onto every one of the per-recipient split messages it builds.
+    This is fixed below by withholding cc/bcc from that first call
+    (letting core's own "To" auto-split behave completely unchanged) and
+    delivering cc/bcc via one small, separate, second ``frappe.sendmail()``
+    call instead. See the inline comment directly above the
+    ``cc_bcc_split_needed`` branch (right before the try/except this
+    replaces) for the full root-cause citation, the rejected
+    merge-cc-into-To alternative and why it was rejected (privacy: it would
+    make up to 99 primary "To" recipients newly visible to each other), and
+    the exact failure-handling contract for the two calls. Below the
+    100-recipient threshold, or when there is no cc/bcc to protect, this
+    is a complete no-op — exactly one frappe.sendmail() call, unchanged
+    from before this fix.
+
     PART 3 ADDITION — email-governance-engine suppression gate
     -------------------------------------------------------------
     Immediately after the recepient/cc/bcc lists are normalized into plain
@@ -424,14 +447,89 @@ def sendmail(
             reference_doctype=reference_doctype, reference_name=reference_name
         )
 
+    # ISS-13 — CC/BCC duplication when the "To" list exceeds core's
+    # own per-message auto-split threshold of 100 recipients
+    # -------------------------------------------------------------
+    # ROOT CAUSE (verified against Frappe core,
+    # ``frappe/email/doctype/email_queue/email_queue.py``):
+    #   - ``QueueBuilder.process()`` (~line 766) decides whether to split
+    #     this send into one Email Queue message per "To" recipient with:
+    #     ``queue_separately = (final_recipients and self.queue_separately)
+    #     or len(final_recipients) > 100`` — note this predicate looks ONLY
+    #     at the length of the "To" list. It never inspects cc/bcc size at
+    #     all.
+    #   - When that fires, ``send_emails()`` (~line 795-809) builds one
+    #     separate message PER "To" recipient, and re-attaches the FULL
+    #     cc+bcc list onto *every single one* of those split messages:
+    #     ``for r in final_recipients: recipients = list(set([r,
+    #     *self.final_cc(), *self.final_bcc()]))``.
+    #   - Net effect: a single ``sendmail()`` call with 150 "To" + 5 CC + 3
+    #     BCC results in each of the 5 CC people receiving 150 copies, and
+    #     each of the 3 BCC people receiving 150 copies. The 150 primary
+    #     "To" recipients each correctly get exactly one copy and (as core
+    #     intends) never see each other in the To/Cc headers.
+    #
+    # REJECTED ALTERNATIVE: folding cc into the "To" list ourselves and
+    # letting core's own chunking-by-100 handle everything uniformly was
+    # considered and rejected. Doing that would make up to 99 primary "To"
+    # recipients newly visible to each other in the To header of any chunk
+    # that also carries the merged cc addresses — a privacy regression for
+    # what is, in this school's context, usually a list of parent/guardian
+    # addresses that must never see one another. The fix below avoids that
+    # entirely: the primary "To" list is handed to core completely
+    # unmodified (core's own per-recipient isolation/auto-split for "To" is
+    # untouched, not reimplemented), and cc/bcc are withheld from that call
+    # and instead delivered via one small, separate second message.
+    #
+    # THE FIX: only when the "To" list is *actually* large enough to
+    # trigger core's own auto-split (``len(recipients) > 100`` — strictly
+    # greater-than, matching core's own boundary exactly so recipients==100
+    # continues to behave exactly as it does today) AND there is cc/bcc to
+    # protect, split this into two independent frappe.sendmail() calls:
+    #   1. The existing call, unchanged, except with cc=[] and bcc=[] — this
+    #      preserves core's per-"To"-recipient auto-split/isolation
+    #      behavior completely unchanged; every "To" recipient still gets
+    #      exactly one copy of the message, with no cc/bcc duplication.
+    #   2. A second, small message carrying only cc/bcc, with the "To" field
+    #      set to a single placeholder address (the send's own ``sender``,
+    #      so the message doesn't have a blank "To" header) or, if there is
+    #      no sender, an empty "To" list — core's own check
+    #      (``email_queue.py`` ~line 767) only throws when
+    #      final_recipients+final_cc+final_bcc are ALL empty, so an empty
+    #      "To" with a non-empty cc/bcc is structurally valid to core. This
+    #      second call's own "To" list can never itself exceed 100 (it is
+    #      at most 1 address), so core's ``len(final_recipients) > 100``
+    #      check can never fire for it regardless of how large cc/bcc are —
+    #      cc/bcc size is therefore never something this fix needs to chunk
+    #      on its own.
+    #
+    # When the trigger condition is false (the common case — recipients
+    # <=100, or no cc/bcc at all), behavior is completely unchanged from
+    # before this fix: exactly one frappe.sendmail() call, with
+    # recipients/cc/bcc exactly as given.
+    #
+    # FAILURE SEMANTICS: the primary call (1) keeps today's exact
+    # fail-fast contract — if it raises, we log "Not Sent" and re-raise
+    # immediately, and the second call is never attempted. The secondary
+    # call (2) must NOT be allowed to turn a successful primary send into a
+    # reported failure for the caller: if it succeeds we log "Sent" for it
+    # too; if it fails we log "Not Sent" for it and record the error via
+    # ``frappe.log_error()``, but we swallow the exception rather than
+    # re-raising, and the function's return value is always the primary
+    # call's result. This extends, to this new secondary send, the same
+    # principle ``_record_ses_log()``'s own docstring already states for
+    # its own failures: "a logging failure must never mask or replace the
+    # real send outcome for the caller."
+    cc_bcc_split_needed = len(recipients) > 100 and bool(cc or bcc)
+
     try:
         result = frappe.sendmail(
             recipients=recipients,
             sender=sender,
             subject=subject,
             message=message,
-            cc=cc,
-            bcc=bcc,
+            cc=[] if cc_bcc_split_needed else cc,
+            bcc=[] if cc_bcc_split_needed else bcc,
             reply_to=reply_to,
             delayed=True,
             email_headers=email_headers,
@@ -439,6 +537,35 @@ def sendmail(
     except Exception:
         _record_ses_log(subject, message, sender, recipients, cc, bcc, status="Not Sent")
         raise
+
+    if cc_bcc_split_needed:
+        _record_ses_log(subject, message, sender, recipients, [], [], status="Sent")
+        cc_bcc_placeholder_recipients = [sender] if sender else []
+        try:
+            frappe.sendmail(
+                recipients=cc_bcc_placeholder_recipients,
+                sender=sender,
+                subject=subject,
+                message=message,
+                cc=cc,
+                bcc=bcc,
+                reply_to=reply_to,
+                delayed=True,
+                email_headers=email_headers,
+            )
+        except Exception:
+            _record_ses_log(
+                subject, message, sender, cc_bcc_placeholder_recipients, cc, bcc, status="Not Sent"
+            )
+            frappe.log_error(
+                title=_("AWS Integration: ISS-13 cc/bcc overflow send failed"),
+                message=frappe.get_traceback(),
+            )
+        else:
+            _record_ses_log(
+                subject, message, sender, cc_bcc_placeholder_recipients, cc, bcc, status="Sent"
+            )
+        return result
 
     _record_ses_log(subject, message, sender, recipients, cc, bcc, status="Sent")
     return result

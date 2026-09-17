@@ -388,6 +388,186 @@ class TestSendmailValidation(FrappeTestCase):
         mock_sendmail.assert_not_called()
 
 
+class TestSendmailCcBccOverflowSplit(FrappeTestCase):
+    """ISS-13 — CC/BCC duplication above core's 100-recipient auto-split.
+
+    Root cause: frappe/email/doctype/email_queue/email_queue.py
+    QueueBuilder.process() splits into one Email Queue message per "To"
+    recipient once len(final_recipients) > 100, and send_emails()
+    re-attaches the FULL cc+bcc list onto every split message — so every
+    cc/bcc address ends up receiving one copy per "To" recipient instead of
+    one copy total. sendmail() now withholds cc/bcc from the primary call
+    in that case and sends them once via a small second call instead. These
+    tests never actually let this call into real core logic (frappe.sendmail
+    is always mocked) — they verify sendmail()'s own branching only.
+    """
+
+    def setUp(self):
+        self.settings_patch = _patch_aws_settings()
+        self.settings_patch.start()
+        self.addCleanup(self.settings_patch.stop)
+
+    @staticmethod
+    def _recipients(n):
+        return [f"user{i}@example.com" for i in range(n)]
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_80_recipients_with_cc_bcc_is_single_unchanged_call(self, mock_sendmail):
+        # <=100 "To" recipients: behavior must be completely unchanged —
+        # exactly one frappe.sendmail() call, with cc/bcc attached directly.
+        sendmail(
+            "Subject",
+            "Body",
+            self._recipients(80),
+            ["cc@example.com"],
+            ["bcc@example.com"],
+        )
+        self.assertEqual(mock_sendmail.call_count, 1)
+        kwargs = mock_sendmail.call_args.kwargs
+        self.assertEqual(kwargs["cc"], ["cc@example.com"])
+        self.assertEqual(kwargs["bcc"], ["bcc@example.com"])
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_100_recipients_exactly_is_boundary_and_does_not_split(self, mock_sendmail):
+        # Boundary: core's own predicate is `> 100`, not `>= 100` — exactly
+        # 100 "To" recipients must NOT trigger the new split path.
+        sendmail(
+            "Subject",
+            "Body",
+            self._recipients(100),
+            ["cc@example.com"],
+            ["bcc@example.com"],
+        )
+        self.assertEqual(mock_sendmail.call_count, 1)
+        kwargs = mock_sendmail.call_args.kwargs
+        self.assertEqual(kwargs["cc"], ["cc@example.com"])
+        self.assertEqual(kwargs["bcc"], ["bcc@example.com"])
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_101_recipients_with_cc_bcc_splits_into_two_calls(self, mock_sendmail):
+        recipients = self._recipients(101)
+        sendmail("Subject", "Body", recipients, ["cc@example.com"], ["bcc@example.com"])
+
+        self.assertEqual(mock_sendmail.call_count, 2)
+
+        first_kwargs = mock_sendmail.call_args_list[0].kwargs
+        self.assertEqual(first_kwargs["recipients"], recipients)
+        self.assertEqual(first_kwargs["cc"], [])
+        self.assertEqual(first_kwargs["bcc"], [])
+
+        second_kwargs = mock_sendmail.call_args_list[1].kwargs
+        self.assertEqual(second_kwargs["recipients"], ["Unity Notices <notifications@unityedu.test>"])
+        self.assertEqual(second_kwargs["cc"], ["cc@example.com"])
+        self.assertEqual(second_kwargs["bcc"], ["bcc@example.com"])
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_150_recipients_with_no_cc_bcc_is_single_call(self, mock_sendmail):
+        # Nothing to protect — no cc/bcc at all — so the split must not
+        # fire even though the "To" list is well over 100.
+        sendmail("Subject", "Body", self._recipients(150), None, None)
+        self.assertEqual(mock_sendmail.call_count, 1)
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_primary_call_failure_reraises_and_skips_second_call(self, mock_sendmail):
+        mock_sendmail.side_effect = frappe.ValidationError("boom")
+
+        with self.assertRaises(frappe.ValidationError):
+            sendmail(
+                "Subject",
+                "Body",
+                self._recipients(101),
+                ["cc@example.com"],
+                ["bcc@example.com"],
+            )
+
+        # Fail-fast: the second (cc/bcc) call must never be attempted when
+        # the primary "To" send itself fails.
+        self.assertEqual(mock_sendmail.call_count, 1)
+
+    @mock.patch("aws_integration.utils.email.frappe.log_error")
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_second_call_failure_does_not_raise_and_returns_primary_result(
+        self, mock_sendmail, mock_log_error
+    ):
+        primary_result = {"queued": True}
+        mock_sendmail.side_effect = [primary_result, frappe.ValidationError("cc/bcc boom")]
+
+        result = sendmail(
+            "Subject",
+            "Body",
+            self._recipients(101),
+            ["cc@example.com"],
+            ["bcc@example.com"],
+        )
+
+        # Primary send already succeeded — its failure-free result must be
+        # returned, and no exception must propagate to the caller.
+        self.assertEqual(result, primary_result)
+        self.assertEqual(mock_sendmail.call_count, 2)
+        mock_log_error.assert_called_once()
+
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_ses_log_written_sent_for_both_primary_and_secondary_calls(self, mock_sendmail):
+        before = frappe.db.count("AWS SES Logs")
+
+        sendmail(
+            "Subject",
+            "Body",
+            self._recipients(101),
+            ["cc@example.com"],
+            ["bcc@example.com"],
+        )
+
+        # One "Sent" row for the primary (To-only) call, one "Sent" row for
+        # the secondary (cc/bcc-only) call.
+        self.assertEqual(frappe.db.count("AWS SES Logs"), before + 2)
+        logs = frappe.get_all(
+            "AWS SES Logs",
+            filters={"subject": "Subject"},
+            fields=["status", "cc_recepients", "recepients"],
+            order_by="creation asc, name asc",
+            limit=2,
+        )
+        statuses = {log["status"] for log in logs}
+        self.assertEqual(statuses, {"Sent"})
+        cc_values = {log["cc_recepients"] for log in logs}
+        self.assertEqual(cc_values, {"", "cc@example.com"})
+
+    @mock.patch("aws_integration.utils.email.mark_promotional_headers")
+    @mock.patch("aws_integration.utils.email.frappe.sendmail")
+    def test_promotional_headers_carry_through_to_both_split_calls(
+        self, mock_sendmail, mock_mark_headers
+    ):
+        # DISPOSER FLAG (point 12): email_headers is computed once, before
+        # the split decision, from a single mark_promotional_headers() call
+        # — confirm it is threaded into BOTH frappe.sendmail() calls
+        # unchanged, so a promotional=True send that triggers the >100
+        # split still carries List-Unsubscribe etc. on the cc/bcc-only
+        # second message instead of silently losing it there.
+        sentinel_headers = {"List-Unsubscribe": "<mailto:unsub@example.com>"}
+        mock_mark_headers.return_value = sentinel_headers
+
+        sendmail(
+            "Subject",
+            "Body",
+            self._recipients(101),
+            ["cc@example.com"],
+            ["bcc@example.com"],
+            promotional=True,
+            reference_doctype="DocType",
+            reference_name="User",
+        )
+
+        self.assertEqual(mock_sendmail.call_count, 2)
+        first_kwargs = mock_sendmail.call_args_list[0].kwargs
+        second_kwargs = mock_sendmail.call_args_list[1].kwargs
+        self.assertEqual(first_kwargs["email_headers"], sentinel_headers)
+        self.assertEqual(second_kwargs["email_headers"], sentinel_headers)
+        # mark_promotional_headers() itself must only be built once, not
+        # re-derived per split call.
+        mock_mark_headers.assert_called_once()
+
+
 class TestSendEmailInBatches(FrappeTestCase):
     """send_email_in_batches(data) — structure documented in the function's
     own docstring: {key: {subject, content, recepients, cc_recepients,
