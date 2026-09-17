@@ -601,12 +601,30 @@ def get_queue(email_batch_size=None):
     """
     Description:
     Get email queue from the database.
-    email_batch_size is the number of emails to be sent in a batch per second.
-    batch_per_minute is the number of emails to be sent in half a minute.
-    batch_size is the number of emails to be sent in a batch.
+
+    email_batch_size is the number of emails to be sent per second (set on
+    AWS Settings). This function is called once per ``flush_email_queue()``
+    run, which is wired to Frappe's ``"all"`` scheduler event (see
+    ``aws_integration/hooks.py``) and therefore fires once per scheduler
+    tick — ``frappe.utils.scheduler.get_scheduler_tick()`` resolves that
+    tick to ``cint(frappe.get_conf().scheduler_tick_interval) or 60``
+    seconds, defaulting to 60s but configurable per-site.
+
+    ISS-29: the batch size previously assumed a hardcoded 30-second flush
+    cycle ("half a minute"), which under-fetched relative to the real
+    60-second default and silently drifted further out of sync on any site
+    that overrides ``scheduler_tick_interval``. We now read the actual
+    configured tick interval so the fetched batch always matches what one
+    flush interval can realistically send.
+
+    flush_interval_seconds is the length, in seconds, of one flush cycle.
+    batch_per_interval is the number of emails sendable in one flush
+    interval at email_batch_size emails/second.
+    batch_size is the number of emails to be fetched in this batch.
     """
-    batch_per_minute = cint(email_batch_size) * 30
-    batch_size = batch_per_minute or cint(frappe.conf.email_queue_batch_size) or 500
+    flush_interval_seconds = cint(frappe.get_conf().scheduler_tick_interval) or 60
+    batch_per_interval = cint(email_batch_size) * flush_interval_seconds
+    batch_size = batch_per_interval or cint(frappe.conf.email_queue_batch_size) or 500
 
     return frappe.db.sql(
 		f"""select

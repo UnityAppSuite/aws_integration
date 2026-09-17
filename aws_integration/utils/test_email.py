@@ -23,6 +23,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from aws_integration.utils.email import (
+    get_queue,
     is_html,
     sendmail,
     send_email_in_batches,
@@ -785,6 +786,123 @@ class TestSendEmailInBatchesReferenceNameDefault(FrappeTestCase):
         with mock.patch("aws_integration.utils.email.frappe.get_value", return_value=5):
             send_email_in_batches(data)
         mock_sendmail.assert_called_once()
+
+
+class TestGetQueueFlushIntervalBatchSize(FrappeTestCase):
+    """ISS-29 — get_queue()'s batch_size must scale off the REAL scheduler
+    flush interval (``scheduler_tick_interval``, default 60s per
+    ``frappe.utils.scheduler.get_scheduler_tick()``), not a hardcoded
+    30-second ("half a minute") assumption. flush_email_queue() is wired to
+    Frappe's "all" scheduler event (aws_integration/hooks.py), which fires
+    once per tick, so the fetched batch must match what one tick can
+    actually send at email_batch_size emails/second.
+
+    frappe.db.sql is mocked in every test here: get_queue() interpolates
+    batch_size directly into the SQL string via an f-string ("limit
+    {batch_size}"), so asserting on the captured SQL text is the most
+    direct way to pin down the exact arithmetic without depending on
+    Email Queue table contents.
+    """
+
+    def _mocked_sql(self, captured):
+        # frappe internals (metadata caching, etc.) run other frappe.db.sql
+        # queries as a side effect of calling get_queue() / frappe.get_conf()
+        # -mocked plumbing, so we can't assume the FIRST captured call is
+        # ours. Only capture calls against `tabEmail Queue` (the query this
+        # function actually issues) and let everything else fall through to
+        # the real frappe.db.sql so the rest of the framework keeps working.
+        real_sql = frappe.db.sql
+
+        def _fake_sql(query, *args, **kwargs):
+            if "tabEmail Queue" in query:
+                captured.append(query)
+                return []
+            return real_sql(query, *args, **kwargs)
+
+        return _fake_sql
+
+    @mock.patch("aws_integration.utils.email.frappe.get_conf")
+    def test_default_site_config_uses_60_second_multiplier(self, mock_get_conf):
+        # No scheduler_tick_interval configured -> frappe.get_conf() returns
+        # a conf object whose .scheduler_tick_interval is falsy/None, same
+        # as get_scheduler_tick()'s own "or 60" fallback.
+        mock_get_conf.return_value = frappe._dict(scheduler_tick_interval=None)
+        captured = []
+        with mock.patch(
+            "aws_integration.utils.email.frappe.db.sql",
+            side_effect=self._mocked_sql(captured),
+        ):
+            get_queue(email_batch_size=5)
+        self.assertIn("limit 300", captured[-1])
+
+    @mock.patch("aws_integration.utils.email.frappe.get_conf")
+    def test_custom_scheduler_tick_interval_is_used_instead_of_hardcoded_value(
+        self, mock_get_conf
+    ):
+        # Site overrides scheduler_tick_interval to 120s -> batch_size must
+        # scale off 120, not a hardcoded 30 (the old bug) or 60.
+        mock_get_conf.return_value = frappe._dict(scheduler_tick_interval=120)
+        captured = []
+        with mock.patch(
+            "aws_integration.utils.email.frappe.db.sql",
+            side_effect=self._mocked_sql(captured),
+        ):
+            get_queue(email_batch_size=5)
+        self.assertIn("limit 600", captured[-1])
+
+    @mock.patch("aws_integration.utils.email.frappe.get_conf")
+    def test_falsy_email_batch_size_falls_back_to_email_queue_batch_size_conf(
+        self, mock_get_conf
+    ):
+        # email_batch_size falsy (0/None) -> unchanged fallback behavior:
+        # cint(frappe.conf.email_queue_batch_size) or 500. This must not be
+        # affected by scheduler_tick_interval at all.
+        mock_get_conf.return_value = frappe._dict(scheduler_tick_interval=120)
+        _original = frappe.conf.get("email_queue_batch_size")
+        frappe.conf.email_queue_batch_size = 42
+        try:
+            captured = []
+            with mock.patch(
+                "aws_integration.utils.email.frappe.db.sql",
+                side_effect=self._mocked_sql(captured),
+            ):
+                get_queue(email_batch_size=None)
+            self.assertIn("limit 42", captured[-1])
+        finally:
+            if _original is None:
+                frappe.conf.pop("email_queue_batch_size", None)
+            else:
+                frappe.conf.email_queue_batch_size = _original
+
+    @mock.patch("aws_integration.utils.email.frappe.get_conf")
+    def test_falsy_email_batch_size_and_no_conf_falls_back_to_500(
+        self, mock_get_conf
+    ):
+        mock_get_conf.return_value = frappe._dict(scheduler_tick_interval=120)
+        _original = frappe.conf.get("email_queue_batch_size")
+        frappe.conf.pop("email_queue_batch_size", None)
+        try:
+            captured = []
+            with mock.patch(
+                "aws_integration.utils.email.frappe.db.sql",
+                side_effect=self._mocked_sql(captured),
+            ):
+                get_queue(email_batch_size=0)
+            self.assertIn("limit 500", captured[-1])
+        finally:
+            if _original is not None:
+                frappe.conf.email_queue_batch_size = _original
+
+    @mock.patch("aws_integration.utils.email.frappe.get_conf")
+    def test_exact_arithmetic_batch_size_5_tick_60_equals_300(self, mock_get_conf):
+        mock_get_conf.return_value = frappe._dict(scheduler_tick_interval=60)
+        captured = []
+        with mock.patch(
+            "aws_integration.utils.email.frappe.db.sql",
+            side_effect=self._mocked_sql(captured),
+        ):
+            get_queue(email_batch_size=5)
+        self.assertIn("limit 300", captured[-1])
 
 
 if __name__ == "__main__":
