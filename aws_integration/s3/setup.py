@@ -36,6 +36,7 @@ def after_migrate():
                 "read_only": 1,
                 "default": "0",
                 "no_copy": 1,
+                "depends_on": "eval:doc.is_on_s3",
             },
             {
                 "fieldname": "s3_uploaded_at",
@@ -58,6 +59,7 @@ def after_migrate():
                 "read_only": 1,
                 "default": "0",
                 "no_copy": 1,
+                "depends_on": "eval:doc.is_on_s3",
             },
             {
                 "fieldname": "s3_upload_skipped",
@@ -67,6 +69,7 @@ def after_migrate():
                 "read_only": 1,
                 "default": "0",
                 "no_copy": 1,
+                "depends_on": "eval:doc.is_on_s3",
             },
         ]
     }
