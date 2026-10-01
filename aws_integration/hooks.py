@@ -25,6 +25,7 @@ override_doctype_class = {
 
 doc_events = {
 	"File": {
+		"onload": "aws_integration.s3.form.add_s3_form_context",
 		"after_insert": "aws_integration.s3.handlers.on_file_upload",
 		"on_trash": "aws_integration.s3.handlers.on_file_delete"
 	}

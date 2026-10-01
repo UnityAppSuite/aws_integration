@@ -10,9 +10,19 @@ from frappe import _
 class S3Client:
     """Wrapper around boto3 S3 client using AWS Settings credentials."""
 
-    def __init__(self):
+    def __init__(self, require_enabled=True, config=None):
+        """Build a client from AWS Settings.
+
+        Args:
+            require_enabled (bool): Refuse to build while AWS or S3 is disabled. Only
+                reads of files that are already on S3 (a System Manager opening one
+                from the File form) pass False, so disabling S3 stops new work
+                without cutting off what is already stored.
+            config (botocore.config.Config, optional): Passed to boto3, for callers
+                that need short timeouts.
+        """
         self.settings = frappe.get_cached_doc("AWS Settings")
-        if not self.settings.enable_aws or not self.settings.enable_s3:
+        if require_enabled and (not self.settings.enable_aws or not self.settings.enable_s3):
             frappe.throw(_("S3 is not enabled in AWS Settings"))
 
         client_kwargs = {
@@ -22,6 +32,8 @@ class S3Client:
         }
         if self.settings.s3_endpoint_url:
             client_kwargs["endpoint_url"] = self.settings.s3_endpoint_url
+        if config:
+            client_kwargs["config"] = config
 
         self.client = boto3.client("s3", **client_kwargs)
         self.bucket = self.settings.s3_bucket_name
