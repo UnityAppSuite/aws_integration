@@ -376,8 +376,11 @@ def get_file_preview(file_name=None, file_url=None):
                 raise frappe.PermissionError
 
     from aws_integration.s3.client import S3Client
+    from aws_integration.s3.form import is_system_manager
 
-    s3_client = S3Client()
+    # With S3 switched off, System Managers can still open a file that is already on
+    # S3 from its form. Everyone else is refused exactly as before.
+    s3_client = S3Client(require_enabled=not is_system_manager())
     presigned_url = s3_client.generate_presigned_url(
         file_doc.s3_key, file_name=file_doc.file_name
     )

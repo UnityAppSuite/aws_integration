@@ -103,6 +103,8 @@ When a browser requests the file URL:
 4. Returns an HTTP 302 redirect to the presigned URL
 5. Browser loads the file directly from S3
 
+Switching S3 off stops new uploads, migration and cleanup. It does not stop a System Manager opening a file that is already on S3 from its File form: `get_file_preview` builds its client without the enabled check for System Managers only (`S3Client(require_enabled=False)`), and everyone else is refused while S3 is off exactly as before. The `generate_file` link used inside documents still needs S3 to be enabled.
+
 ### Local Cleanup
 
 The `cleanup_local_s3_files` function:
@@ -138,6 +140,12 @@ All upload paths (instant, scheduled, bulk migration) use `SELECT ... FOR UPDATE
 - **"Upload to S3"** button for local files not yet on S3 (with confirmation dialog)
 - **"Delete Local File"** button when `is_on_s3=1` and `local_deleted=0` (System Manager only, with confirmation dialog)
 - Auto-refreshes when background S3 upload completes (via realtime events)
+
+#### When S3 is disabled
+
+With **Enable S3 File Storage** (or **Enable AWS**) off, the File form says nothing about S3 to anyone: no S3 fields, no indicator, no buttons. The one exception is a System Manager opening a file that is already on S3 while the bucket can be reached; that form keeps the S3 fields, the indicator and the buttons.
+
+The server (`aws_integration.s3.form.add_s3_form_context`, a File `onload` hook) sends the form `enabled` and, only when S3 is off, only to a System Manager and only for a file that is on S3, `connected`. AWS keeps no connection status, so `connected` is a short `head_bucket` call (3 second timeouts, even with S3 off) whose answer is cached for a minute. Opening a file never waits on S3 for anyone else.
 
 ### AWS Settings (`aws_settings.js`)
 

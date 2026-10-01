@@ -1,5 +1,13 @@
 frappe.ui.form.on("File", {
     refresh: function (frm) {
+        // With S3 switched off the form says nothing about S3 (see s3_ui_visible).
+        if (!s3_ui_visible(frm)) {
+            set_s3_fields_hidden(frm, true);
+            return;
+        }
+        // A form is reused from file to file, so undo what an earlier file hid.
+        set_s3_fields_hidden(frm, false);
+
         if (frm.doc.is_on_s3 && frm.doc.s3_key) {
             // Add S3 indicator
             let label = frm.doc.local_deleted
@@ -98,3 +106,34 @@ frappe.ui.form.on("File", {
         });
     },
 });
+
+// With S3 switched off the File form shows nothing about S3: no fields, no status, no
+// buttons. The one exception is a file that is already on S3, for System Managers,
+// while the bucket can be reached: that is where they still need the S3 details and
+// tools. The server sends both facts (see add_s3_form_context).
+function s3_ui_visible(frm) {
+    const s3 = (frm.doc.__onload || {}).s3 || {};
+    if (s3.enabled !== false) {
+        return true;
+    }
+    return frappe.user.has_role("System Manager") && s3.state === "stored" && s3.connected === true;
+}
+
+const S3_FIELDS = [
+    "s3_info_section",
+    "s3_key",
+    "s3_status_section",
+    "is_on_s3",
+    "s3_uploaded_at",
+    "s3_col_break",
+    "local_deleted",
+    "s3_upload_skipped",
+];
+
+function set_s3_fields_hidden(frm, hidden) {
+    S3_FIELDS.forEach(function (name) {
+        if (frm.fields_dict[name]) {
+            frm.set_df_property(name, "hidden", hidden ? 1 : 0);
+        }
+    });
+}
