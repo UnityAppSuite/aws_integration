@@ -4,6 +4,17 @@ from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
 def after_migrate():
     """Create custom fields on File DocType for S3 integration."""
+    try:
+        _create_s3_custom_fields()
+    except Exception:
+        frappe.log_error(
+            title="aws_integration after_migrate failed",
+            message=frappe.get_traceback(),
+        )
+        frappe.logger("aws_integration").exception("after_migrate failed")
+
+
+def _create_s3_custom_fields():
     custom_fields = {
         "File": [
             {
