@@ -1,10 +1,11 @@
 import mimetypes
 import os
 
-import boto3
 import frappe
 from botocore.exceptions import ClientError
 from frappe import _
+
+from aws_integration.lazy_boto import get_boto3
 
 
 class S3Client:
@@ -24,7 +25,7 @@ class S3Client:
         if endpoint_url:
             client_kwargs["endpoint_url"] = endpoint_url
 
-        self.client = boto3.client("s3", **client_kwargs)
+        self.client = get_boto3().client("s3", **client_kwargs)
         self.bucket = self.settings.s3_bucket_name
         self.prefix = self.settings.s3_folder_prefix or frappe.local.site
 
@@ -129,7 +130,9 @@ class S3Client:
 
         # Use multipart upload for files > 5 MB
         if file_size > 5 * 1024 * 1024:
-            config = boto3.s3.transfer.TransferConfig(
+            from boto3.s3.transfer import TransferConfig
+
+            config = TransferConfig(
                 multipart_threshold=5 * 1024 * 1024,
                 multipart_chunksize=5 * 1024 * 1024,
             )
