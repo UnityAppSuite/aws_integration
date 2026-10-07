@@ -3,11 +3,12 @@ import os
 import re
 import traceback
 
-import boto3
 import frappe
 from frappe import _
 from frappe.utils import cint, now_datetime
 from frappe.utils.backups import new_backup
+
+from aws_integration.lazy_boto import get_boto3
 
 # ── Whitelisted APIs ──
 
@@ -440,7 +441,7 @@ def _get_s3_client(settings):
 	if settings.s3_endpoint_url:
 		client_kwargs["endpoint_url"] = settings.s3_endpoint_url
 
-	return boto3.client("s3", **client_kwargs)
+	return get_boto3().client("s3", **client_kwargs)
 
 
 def _cleanup_local_backups(log, paths):

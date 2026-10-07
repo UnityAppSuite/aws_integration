@@ -1,9 +1,10 @@
 # Copyright (c) 2024, Hybrowlabs Technologies and contributors
 # For license information, please see license.txt
-import boto3
 import frappe
 from frappe import _
 from frappe.model.document import Document
+
+from aws_integration.lazy_boto import get_boto3
 from aws_integration.utils import validate_email
 
 
@@ -41,6 +42,7 @@ class AWSSettings(Document):
         )
 
     def get_ses_client(self):
+        boto3 = get_boto3()
         aws_secret_access_key = self.get_password("aws_secret_access_key")
         return boto3.client(
             "sesv2",
